@@ -1,0 +1,57 @@
+# ===================================
+# TELEGRAM BOT SETTINGS
+# ===================================
+BOT_TOKEN=your_bot_token_from_botfather
+
+# ===================================
+# TELETHON (USER ACCOUNT) SETTINGS
+# ===================================
+# Получить на https://my.telegram.org
+TELETHON_API_ID=your_api_id
+TELETHON_API_HASH=your_api_hash
+TELETHON_PHONE=+79991234567
+
+# ===================================
+# SUPABASE SETTINGS
+# ===================================
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your_supabase_anon_key
+
+# ===================================
+# ADMIN SETTINGS
+# ===================================
+# Telegram ID администратора (можно узнать у @userinfobot)
+ADMIN_IDS=123456789,987654321
+
+# ===================================
+# CHANNELS SETTINGS
+# ===================================
+# Обязательный канал для подписки
+REQUIRED_CHANNEL=@your_channel
+
+# Бот для добавления вакансий (username без @ или полная ссылка)
+ADD_VACANCY_BOT=@your_add_vacancy_bot
+
+# Бот для отзывов (username без @ или полная ссылка)
+FEEDBACK_BOT=@your_feedback_bot
+
+# ===================================
+# PARSER SETTINGS
+# ===================================
+# Интервал парсинга в минутах
+PARSE_INTERVAL_MINUTES=5
+
+# Максимум вакансий за один парсинг
+MAX_VACANCIES_PER_PARSE=50
+
+# ===================================
+# RATE LIMITS
+# ===================================
+# Минимальная задержка между сообщениями пользователю (секунды)
+MIN_DELAY_BETWEEN_MESSAGES=2
+
+# Максимум сообщений в час одному пользователю
+MAX_MESSAGES_PER_HOUR=30
+
+
+

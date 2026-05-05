@@ -1,0 +1,17 @@
+# ===================================
+# FEEDBACK BOT SETTINGS
+# ===================================
+# Токен бота для отзывов (получить у @BotFather)
+FEEDBACK_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+
+# ===================================
+# SUPABASE SETTINGS
+# ===================================
+# Используется та же БД что и основной бот
+# URL вашего проекта Supabase
+SUPABASE_URL=https://your-project-id.supabase.co
+
+# Anon/Public ключ из настроек проекта Supabase
+# Найти в: Project Settings → API → Project API keys → anon/public
+SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlvdXItcHJvamVjdC1pZCIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNjQ1OTg3NjU0LCJleHAiOjE5NjE1NjM2NTR9.your-anon-key-here
+
