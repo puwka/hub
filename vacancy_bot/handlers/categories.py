@@ -12,7 +12,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from config import CATEGORIES, config
+from config import CATEGORIES, config, REFERRAL_BONUS_DAYS, REVIEW_BONUS_DAYS
 from database import db
 from keyboards import categories_keyboard, main_menu_keyboard
 
@@ -295,17 +295,19 @@ async def category_callback(callback: CallbackQuery):
             
             # Добавляем информацию о реферальной системе
             referral_text += (
-                "<blockquote>💡 За каждого приглашенного друга ты получаешь +24 часа статуса x2.\n"
-                "Пользователи с x2 получают 100% вакансий, обычные — 90%.</blockquote>"
+                f"<blockquote>💡 За каждого приглашённого друга ты получаешь "
+                f"+{REFERRAL_BONUS_DAYS} день к подписке.\n"
+                "Без активной подписки вакансии не приходят.</blockquote>"
             )
             
             # Добавляем информацию о системе отзывов
             if feedback_link:
                 referral_text += (
                     "\n\n"
-                    "💬 <b>Оставь отзыв и получи 3 дня x2!</b>\n\n"
+                    f"💬 <b>Оставь отзыв и получи {REVIEW_BONUS_DAYS} дня подписки!</b>\n\n"
                     f"📝 Перейди в бот отзывов: {feedback_link}\n\n"
-                    "<blockquote>✨ За каждый одобренный отзыв ты получишь <b>3 дня x2 статуса</b>!\n"
+                    f"<blockquote>✨ За каждый одобренный отзыв ты получишь "
+                    f"<b>{REVIEW_BONUS_DAYS} дня подписки</b>!\n"
                     "Отзыв проходит модерацию перед одобрением.</blockquote>"
                 )
             

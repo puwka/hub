@@ -4,6 +4,17 @@
 BOT_TOKEN=your_bot_token_from_botfather
 
 # ===================================
+# СЕТЬ (обязательно для РФ)
+# ===================================
+# SOCKS5/HTTP прокси VPN-клиента на вашем ПК (НЕ удалённый IP!)
+# v2rayN: socks5://127.0.0.1:10808
+# Clash:  socks5://127.0.0.1:7890
+PROXY_URL=socks5://127.0.0.1:10808
+
+# Альтернатива: свой локальный Bot API сервер (без PROXY_URL)
+# TELEGRAM_API_SERVER=http://127.0.0.1:8081
+
+# ===================================
 # TELETHON (USER ACCOUNT) SETTINGS
 # ===================================
 # Получить на https://my.telegram.org
@@ -35,8 +46,13 @@ ADD_VACANCY_BOT=@your_add_vacancy_bot
 # Бот для отзывов (username без @ или полная ссылка)
 FEEDBACK_BOT=@your_feedback_bot
 
+# Контакт для оплаты подписки (@username или https://t.me/username)
+PAYMENT_CONTACT=@your_username
+
+# Чат модерации вакансий (ID группы, например -1001234567890, или @username)
+MODERATION_CHAT=
+
 # ===================================
-# PARSER SETTINGS
 # ===================================
 # Интервал парсинга в минутах
 PARSE_INTERVAL_MINUTES=5
@@ -53,5 +69,27 @@ MIN_DELAY_BETWEEN_MESSAGES=2
 # Максимум сообщений в час одному пользователю
 MAX_MESSAGES_PER_HOUR=30
 
+# ===================================
+# ФИЛЬТРАЦИЯ ВАКАНСИЙ
+# ===================================
+FILTER_MIN_TEXT_LENGTH=150
+FILTER_MAX_LINKS=5
+FILTER_MIN_LLM_CONFIDENCE=60
+FILTER_MIN_RULE_CONFIDENCE=50
+FILTER_MIN_QUALITY_SCORE=20
+FILTER_SIMHASH_THRESHOLD=0.90
+FILTER_EMBEDDING_THRESHOLD=0.90
+FILTER_DEDUP_DAYS=14
+FILTER_DEDUP_COUNT=500
 
+# ===================================
+# LLM (OpenAI-compatible API)
+# ===================================
+LLM_ENABLED=false
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+LLM_EMBEDDING_MODEL=text-embedding-3-small
+LLM_EXTRACT_ENABLED=true
+LLM_TIMEOUT_SECONDS=30
 

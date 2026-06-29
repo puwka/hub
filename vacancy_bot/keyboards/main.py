@@ -11,7 +11,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-from config import CATEGORIES, config
+from config import CATEGORIES, config, SUBSCRIPTION_PLANS
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -26,8 +26,26 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         KeyboardButton(text="Реферальная система"),
         KeyboardButton(text="Помощь")
     )
+    builder.row(KeyboardButton(text="Подписка"))
     
     return builder.as_markup(resize_keyboard=True)
+
+
+def vacancy_subscription_plans_keyboard() -> InlineKeyboardMarkup:
+    """Тарифы подписки на вакансии"""
+    builder = InlineKeyboardBuilder()
+    for plan_id, plan in SUBSCRIPTION_PLANS.items():
+        if config.payment.stars_enabled:
+            price_text = f"{plan['price_stars']} ⭐"
+        else:
+            price_text = f"{plan['price_rub']} ₽"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{plan['label']} — {price_text}",
+                callback_data=f"buy_sub:{plan_id}",
+            )
+        )
+    return builder.as_markup()
 
 
 def subscription_keyboard(channel: str) -> InlineKeyboardMarkup:
@@ -219,7 +237,42 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             callback_data="admin:referral_photo"
         )
     )
+    builder.row(
+        InlineKeyboardButton(
+            text="Выдать подписку",
+            callback_data="admin:grant_subscription"
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="Фильтр вакансий",
+            callback_data="admin:filter_stats"
+        )
+    )
+    stars_status = "✅" if config.payment.stars_enabled else "❌"
+    builder.row(
+        InlineKeyboardButton(
+            text=f"Оплата Stars {stars_status}",
+            callback_data="admin:toggle_stars"
+        )
+    )
     
+    return builder.as_markup()
+
+
+def admin_grant_plans_keyboard(tg_id: int) -> InlineKeyboardMarkup:
+    """Выбор тарифа для выдачи подписки пользователю"""
+    builder = InlineKeyboardBuilder()
+    for plan_id, plan in SUBSCRIPTION_PLANS.items():
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{plan['label']} ({plan['days']} дн.)",
+                callback_data=f"grant_sub:{plan_id}:{tg_id}",
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="← В панель", callback_data="admin:back")
+    )
     return builder.as_markup()
 
 

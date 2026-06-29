@@ -14,17 +14,27 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 
-from config import config
+from config import config, moderation_enabled
 from database import db
 from scheduler import TaskScheduler
+from utils.proxy import (
+    create_aiogram_session,
+    get_telegram_api_server,
+    iter_proxy_candidates,
+    warn_if_remote_proxy_misconfigured,
+)
+from utils.subscription_check import verify_bot_channel_access
 from handlers import (
     user_router,
     categories_router,
     user_vacancy_router,
-    admin_router
+    admin_router,
+    subscription_router,
+    vacancy_moderation_router,
 )
 from middlewares import SubscriptionMiddleware
 
@@ -35,6 +45,12 @@ from middlewares import SubscriptionMiddleware
 
 def setup_logging():
     """Настройка логирования"""
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure:
+                reconfigure(encoding="utf-8", errors="replace")
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -60,6 +76,57 @@ logger = logging.getLogger(__name__)
 # ИНИЦИАЛИЗАЦИЯ БОТА
 # =========================================
 
+async def create_bot() -> Bot:
+    """Создаёт бота, автоматически подбирая рабочий прокси."""
+    warn_if_remote_proxy_misconfigured()
+    api_server = get_telegram_api_server()
+    candidates = iter_proxy_candidates()
+    if not candidates and not api_server:
+        candidates = [None]
+
+    bot_kwargs = {
+        "token": config.bot.token,
+        "default": DefaultBotProperties(parse_mode=ParseMode.HTML),
+    }
+    if api_server:
+        bot_kwargs["api"] = api_server
+
+    last_error: Exception | None = None
+    for proxy in candidates:
+        session = create_aiogram_session(proxy)
+        bot = Bot(session=session, **bot_kwargs)
+        try:
+            me = await bot.get_me()
+            via = proxy or "без прокси"
+            logger.info("Telegram API: OK (@%s) через %s", me.username, via)
+            if proxy and proxy != config.network.proxy_url:
+                logger.warning(
+                    "Обновите PROXY_URL в .env на: %s", proxy
+                )
+            return bot
+        except TelegramUnauthorizedError:
+            await bot.session.close()
+            logger.error(
+                "BOT_TOKEN недействителен (Unauthorized).\n"
+                "Откройте @BotFather → /mybots → ваш бот → API Token "
+                "и вставьте полный токен в .env"
+            )
+            sys.exit(1)
+        except Exception as e:
+            last_error = e
+            await bot.session.close()
+            logger.debug("Прокси %s не подошёл: %s", proxy or "direct", e)
+
+    logger.error(
+        "Не удалось подключиться к Telegram Bot API.\n"
+        "Последняя ошибка: %s\n"
+        "Включите VPN (v2rayN/Clash) и укажите локальный прокси, "
+        "например PROXY_URL=socks5://127.0.0.1:10808",
+        last_error,
+    )
+    sys.exit(1)
+
+
 async def on_startup(bot: Bot, scheduler: TaskScheduler):
     """Действия при запуске бота"""
     logger.info("=" * 50)
@@ -68,15 +135,33 @@ async def on_startup(bot: Bot, scheduler: TaskScheduler):
     
     # Подключаемся к Supabase
     db.connect()
+
+    channel_error = await verify_bot_channel_access(bot)
+    if channel_error:
+        logger.error("Проверка подписки: %s", channel_error)
+        for admin_id in config.admin.ids:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ <b>Настройка канала</b>\n\n{channel_error}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
     
     # Запускаем планировщик
     await scheduler.start()
+
+    if scheduler.distributor and moderation_enabled():
+        await scheduler.distributor.send_pending_to_moderation()
     
     # Информация о боте
     me = await bot.get_me()
     logger.info(f"🤖 Бот: @{me.username}")
     logger.info(f"📊 Админы: {config.admin.ids}")
     logger.info(f"📢 Обязательный канал: {config.channel.required_channel}")
+    if moderation_enabled():
+        logger.info(f"📥 Чат модерации: {config.channel.moderation_chat}")
     logger.info("=" * 50)
     
     # Уведомляем админов
@@ -125,12 +210,13 @@ async def main():
     if not config.supabase.url or not config.supabase.key:
         logger.error("❌ SUPABASE_URL или SUPABASE_KEY не указаны!")
         sys.exit(1)
-    
-    # Создаем бота
-    bot = Bot(
-        token=config.bot.token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
+
+    if not config.network.proxy_url and not config.network.telegram_api_server:
+        logger.warning(
+            "PROXY_URL не задан — будет выполнен авто-поиск локального VPN-прокси"
+        )
+
+    bot = await create_bot()
     
     # Создаем диспетчер
     dp = Dispatcher(storage=MemoryStorage())
@@ -141,15 +227,16 @@ async def main():
     
     # Регистрируем роутеры
     dp.include_router(admin_router)  # Админ первый для приоритета
+    dp.include_router(vacancy_moderation_router)
     dp.include_router(user_vacancy_router)
     dp.include_router(categories_router)
+    dp.include_router(subscription_router)
     dp.include_router(user_router)  # Пользователь последний (catch-all)
     
     # Создаем планировщик
     scheduler = TaskScheduler(bot)
     
     try:
-        # Запускаем бота
         await on_startup(bot, scheduler)
         
         # Запускаем polling

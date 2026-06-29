@@ -11,7 +11,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from aiogram import Bot
 
 from config import config
-from parser.telethon_parser import parser as telegram_parser
+from parser.telethon_parser import TelegramParser, parser as telegram_parser
 from services import VacancyDistributor
 from database import db
 
@@ -93,6 +93,9 @@ class TaskScheduler:
                 return
             
             sources_count, vacancies_count = await self.parser.parse_all_sources()
+
+            if self.distributor:
+                await self.distributor.send_pending_to_moderation()
             
             logger.info(
                 f"✅ Парсинг завершен: "

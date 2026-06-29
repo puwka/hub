@@ -11,7 +11,9 @@ from .main import (
     admin_keyboard,
     moderation_keyboard,
     sources_keyboard,
-    vacancy_pagination_keyboard
+    vacancy_pagination_keyboard,
+    vacancy_subscription_plans_keyboard,
+    admin_grant_plans_keyboard,
 )
 
 __all__ = [
@@ -24,6 +26,8 @@ __all__ = [
     "admin_keyboard",
     "moderation_keyboard",
     "sources_keyboard",
-    "vacancy_pagination_keyboard"
+    "vacancy_pagination_keyboard",
+    "vacancy_subscription_plans_keyboard",
+    "admin_grant_plans_keyboard",
 ]
 

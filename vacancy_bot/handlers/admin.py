@@ -5,19 +5,21 @@
 
 import logging
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from config import config, CATEGORIES, is_admin
+from config import config, CATEGORIES, is_admin, SUBSCRIPTION_PLANS
 from database import db
 from keyboards.main import (
-    admin_keyboard, 
+    admin_keyboard,
     moderation_keyboard,
     sources_keyboard,
-    vacancy_pagination_keyboard
+    vacancy_pagination_keyboard,
+    admin_grant_plans_keyboard,
 )
+from utils.subscription import format_subscription_status_html, parse_subscription_until
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ class AdminStates(StatesGroup):
     waiting_for_categories_photo = State()
     waiting_for_welcome_photo = State()
     waiting_for_referral_photo = State()
+    waiting_for_grant_user_id = State()
 
 
 # =========================================
@@ -149,7 +152,8 @@ async def approve_vacancy(callback: CallbackQuery, bot: Bot):
                 text=vacancy["text"],
                 category=vacancy["category"],
                 source=f"user:{vacancy['tg_id']}",
-                source_message_id=None
+                source_message_id=None,
+                moderation_status="approved",
             )
             
             # Уведомляем автора
@@ -454,18 +458,77 @@ async def admin_stats(callback: CallbackQuery):
         return
     
     stats = await db.get_stats()
+    filter_metrics = await db.get_filter_metrics()
+    today = filter_metrics.get("today") or {}
     
     text = (
-        "Статистика\n\n"
-        f"Пользователи: {stats.get('users', 0)}\n"
-        f"Вакансии в базе: {stats.get('vacancies', 0)}\n"
-        f"На модерации: {stats.get('pending_moderation', 0)}\n"
-        f"Источники: {stats.get('active_sources', 0)}"
+        "📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователи: {stats.get('users', 0)}\n"
+        f"💼 Вакансии в базе: {stats.get('vacancies', 0)}\n"
+        f"⏳ На модерации: {stats.get('pending_moderation', 0)}\n"
+        f"📡 Источники: {stats.get('active_sources', 0)}\n\n"
+        "<b>Фильтр (сегодня)</b>\n"
+        f"📨 Сообщений: {today.get('messages_received', 0)}\n"
+        f"✅ Сохранено: {today.get('vacancies_saved', 0)}\n"
+        f"❌ Отклонено: {today.get('vacancies_rejected', 0)}\n"
+        f"🔁 Дублей: {today.get('duplicates_rejected', 0)}\n"
+        f"⭐ Средний quality: {today.get('avg_quality_score', 0)}"
     )
     
     await callback.message.edit_text(
         text,
+        parse_mode="HTML",
         reply_markup=admin_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:filter_stats")
+async def admin_filter_stats(callback: CallbackQuery):
+    """Dashboard метрик фильтрации."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+
+    metrics = await db.get_filter_metrics()
+    today = metrics.get("today") or {}
+    top_sources = metrics.get("top_sources") or []
+    recent = metrics.get("recent_logs") or []
+
+    lines = [
+        "🔍 <b>Dashboard фильтрации</b>\n",
+        "<b>Сегодня</b>",
+        f"📨 Получено: {today.get('messages_received', 0)}",
+        f"✅ Вакансий найдено: {today.get('vacancies_saved', 0)}",
+        f"❌ Отклонено: {today.get('vacancies_rejected', 0)}",
+        f"🔁 Дублей: {today.get('duplicates_rejected', 0)}",
+        f"⭐ Средний quality score: {today.get('avg_quality_score', 0)}",
+    ]
+
+    if top_sources:
+        lines.append("\n<b>Топ чатов по quality</b>")
+        for i, src in enumerate(top_sources[:5], 1):
+            sid = src.get("source_id", "?")
+            avg = src.get("avg_quality_score", 0)
+            saved = src.get("saved_total", 0)
+            lines.append(f"{i}. {sid} — {avg:.0f} ({saved} saved)")
+
+    if recent:
+        lines.append("\n<b>Последние решения</b>")
+        for log in recent[:5]:
+            dec = "✅" if log.get("decision") == "saved" else "❌"
+            lines.append(
+                f"{dec} {log.get('source', '?')}: "
+                f"{log.get('stage', '')} — {str(log.get('reason', ''))[:40]}"
+            )
+
+    llm_status = "включён" if config.llm.enabled else "выключен (rule-based)"
+    lines.append(f"\n🤖 LLM: {llm_status}")
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(),
     )
     await callback.answer()
 
@@ -496,11 +559,16 @@ async def admin_parse_now(callback: CallbackQuery):
         
         if parser.is_authorized:
             sources_count, vacancies_count = await parser.parse_all_sources()
+
+            from services.distribution import VacancyDistributor
+            distributor = VacancyDistributor(callback.bot, parser)
+            mod_sent = await distributor.send_pending_to_moderation()
             
             await callback.message.edit_text(
                 "Парсинг завершён.\n\n"
                 f"Источники: {sources_count}\n"
-                f"Новые вакансии: {vacancies_count}",
+                f"Новые вакансии: {vacancies_count}\n"
+                f"В модерацию: {mod_sent}",
                 reply_markup=admin_keyboard()
             )
         else:
@@ -1227,7 +1295,7 @@ async def approve_review(callback: CallbackQuery, bot: Bot):
     
     review_id = int(callback.data.split(":")[2])
     
-    # Одобряем отзыв и начисляем x2
+    # Одобряем отзыв и продлеваем подписку
     success = await db.approve_review(review_id, callback.from_user.id)
     
     if success:
@@ -1238,8 +1306,8 @@ async def approve_review(callback: CallbackQuery, bot: Bot):
                 await bot.send_message(
                     review["tg_id"],
                     "✅ <b>Ваш отзыв одобрен!</b>\n\n"
-                    "🎉 Вам начислено <b>3 дня x2 статуса</b>!\n\n"
-                    "✨ Теперь вы будете получать <b>100% вакансий</b> вместо 90%.\n\n"
+                    "🎉 Вам начислено <b>3 дня подписки</b>!\n\n"
+                    "✨ Вакансии снова будут приходить автоматически.\n\n"
                     "Спасибо за ваш отзыв! 🙏",
                     parse_mode="HTML"
                 )
@@ -1291,7 +1359,7 @@ async def approve_review(callback: CallbackQuery, bot: Bot):
                 except Exception as e:
                     logger.error(f"Ошибка публикации отзыва {review_id} в канал: {e}")
         
-        await callback.answer("✅ Отзыв одобрен, x2 начислен")
+        await callback.answer("✅ Отзыв одобрен, подписка продлена")
         
         # Показываем следующий отзыв или возвращаемся в меню
         reviews = await db.get_pending_reviews(limit=1)
@@ -1386,3 +1454,197 @@ async def receive_reject_reason(message: Message, state: FSMContext, bot: Bot):
 async def skip_review(callback: CallbackQuery):
     """Пропустить отзыв (показать следующий)"""
     await admin_reviews_moderation(callback)
+
+
+# =========================================
+# ВЫДАЧА ПОДПИСКИ
+# =========================================
+
+async def _notify_subscription_granted(bot: Bot, tg_id: int, label: str, days: int):
+    """Уведомить пользователя о продлении подписки."""
+    user = await db.get_user(tg_id)
+    until = user.get("x2_until") if user else None
+    status = format_subscription_status_html(until).strip()
+
+    try:
+        await bot.send_message(
+            tg_id,
+            f"✅ <b>Подписка активирована!</b>\n\n"
+            f"Тариф: <b>{label}</b> (+{days} дн.)\n"
+            f"{status}\n\n"
+            "Вакансии снова будут приходить по вашим направлениям.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("Не удалось уведомить %s о подписке: %s", tg_id, e)
+
+
+async def _apply_subscription_grant(
+    bot: Bot,
+    tg_id: int,
+    days: int,
+    label: str,
+) -> tuple[bool, str]:
+    user = await db.get_user(tg_id)
+    if not user:
+        return False, f"Пользователь {tg_id} не найден в базе."
+
+    ok = await db.extend_subscription(tg_id, days=days)
+    if not ok:
+        return False, "Не удалось продлить подписку в базе."
+
+    await _notify_subscription_granted(bot, tg_id, label, days)
+    user = await db.get_user(tg_id)
+    until = parse_subscription_until(user.get("x2_until") if user else None)
+    until_str = until.strftime("%d.%m.%Y %H:%M UTC") if until else "—"
+    return True, f"✅ Подписка выдана пользователю {tg_id}\nТариф: {label}\nДействует до: {until_str}"
+
+
+@router.message(Command("grant_sub"))
+async def cmd_grant_sub(message: Message, bot: Bot):
+    """
+    Быстрая выдача подписки.
+    /grant_sub <tg_id> <week|month|half_year|year>
+    /grant_sub <tg_id> <дней>
+    """
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        plans = ", ".join(SUBSCRIPTION_PLANS.keys())
+        await message.answer(
+            "Использование:\n"
+            f"<code>/grant_sub TG_ID тариф</code>\n\n"
+            f"Тарифы: {plans}\n"
+            "Или укажите число дней: <code>/grant_sub TG_ID 30</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        tg_id = int(parts[1])
+    except ValueError:
+        await message.answer("TG_ID должен быть числом.")
+        return
+
+    arg = parts[2].lower()
+    if arg in SUBSCRIPTION_PLANS:
+        plan = SUBSCRIPTION_PLANS[arg]
+        days = plan["days"]
+        label = plan["label"]
+    elif arg.isdigit():
+        days = int(arg)
+        label = f"{days} дней"
+    else:
+        await message.answer(f"Неизвестный тариф «{arg}».")
+        return
+
+    ok, text = await _apply_subscription_grant(bot, tg_id, days, label)
+    await message.answer(text, reply_markup=admin_keyboard() if ok else None)
+
+
+@router.callback_query(F.data == "admin:grant_subscription")
+async def admin_grant_subscription_start(callback: CallbackQuery, state: FSMContext):
+    """Начать выдачу подписки — запрос TG ID"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_grant_user_id)
+    await callback.message.edit_text(
+        "📅 <b>Выдача подписки</b>\n\n"
+        "Отправьте <b>Telegram ID</b> пользователя.\n"
+        "Узнать ID: @userinfobot",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_grant_user_id)
+async def admin_grant_subscription_user(message: Message, state: FSMContext):
+    """Получен TG ID — показать тарифы"""
+    if not is_admin(message.from_user.id):
+        return
+
+    try:
+        tg_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("Введите числовой Telegram ID, например: 1001949438")
+        return
+
+    user = await db.get_user(tg_id)
+    if not user:
+        await message.answer(
+            f"Пользователь {tg_id} не найден.\n"
+            "Он должен хотя бы раз написать боту /start.",
+            reply_markup=admin_keyboard(),
+        )
+        await state.clear()
+        return
+
+    name = user.get("first_name") or user.get("username") or str(tg_id)
+    stats = await db.get_referral_stats(tg_id)
+    status = format_subscription_status_html(stats.get("subscription_until")).strip()
+
+    await message.answer(
+        f"👤 <b>{name}</b> (<code>{tg_id}</code>)\n{status}\n\n"
+        "Выберите тариф для начисления:",
+        parse_mode="HTML",
+        reply_markup=admin_grant_plans_keyboard(tg_id),
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("grant_sub:"))
+async def admin_grant_subscription_apply(callback: CallbackQuery, bot: Bot):
+    """Применить выбранный тариф"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    plan_id, tg_id_str = parts[1], parts[2]
+    plan = SUBSCRIPTION_PLANS.get(plan_id)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+
+    try:
+        tg_id = int(tg_id_str)
+    except ValueError:
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+
+    ok, text = await _apply_subscription_grant(
+        bot, tg_id, plan["days"], plan["label"]
+    )
+    await callback.message.edit_text(text, reply_markup=admin_keyboard())
+    await callback.answer("Готово" if ok else "Ошибка", show_alert=not ok)
+
+
+# =========================================
+# ПЕРЕКЛЮЧЕНИЕ ОПЛАТЫ STARS
+# =========================================
+
+@router.callback_query(F.data == "admin:toggle_stars")
+async def toggle_stars_payment(callback: CallbackQuery):
+    """Включить/выключить оплату через Telegram Stars."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    config.payment.stars_enabled = not config.payment.stars_enabled
+    status = "включена ✅" if config.payment.stars_enabled else "выключена ❌"
+    logger.info(
+        "⭐ Оплата Stars %s админом %s",
+        status, callback.from_user.id,
+    )
+
+    await callback.message.edit_reply_markup(reply_markup=admin_keyboard())
+    await callback.answer(f"Оплата Stars {status}", show_alert=True)
+

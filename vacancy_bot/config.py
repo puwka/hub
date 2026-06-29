@@ -50,6 +50,22 @@ class ChannelConfig:
     add_vacancy_bot: str = field(default_factory=lambda: os.getenv("ADD_VACANCY_BOT", ""))
     feedback_bot: str = field(default_factory=lambda: os.getenv("FEEDBACK_BOT", ""))
     reviews_channel: str = field(default_factory=lambda: os.getenv("REVIEWS_CHANNEL", ""))
+    moderation_chat: str = field(default_factory=lambda: os.getenv("MODERATION_CHAT", "").strip())
+
+
+def get_moderation_chat_id() -> str | int | None:
+    """ID или @username чата модерации вакансий."""
+    chat = config.channel.moderation_chat
+    if not chat:
+        return None
+    stripped = chat.strip()
+    if stripped.lstrip("-").isdigit():
+        return int(stripped)
+    return stripped if stripped.startswith("@") else f"@{stripped}"
+
+
+def moderation_enabled() -> bool:
+    return bool(config.channel.moderation_chat)
 
 
 # ============================================
@@ -58,6 +74,23 @@ class ChannelConfig:
 
 # Максимальная длина текста вакансии (символов)
 MAX_VACANCY_LENGTH = 500
+
+# Бонус за каждого приглашённого друга (дней подписки)
+REFERRAL_BONUS_DAYS = 1
+
+# Подписка при первом входе в бота
+WELCOME_SUBSCRIPTION_DAYS = 5
+
+# Бонус за одобренный отзыв
+REVIEW_BONUS_DAYS = 3
+
+# Тарифы подписки (оплата вручную / Stars)
+SUBSCRIPTION_PLANS = {
+    "week": {"days": 7, "price_rub": 49, "price_stars": 50, "label": "1 неделя"},
+    "month": {"days": 30, "price_rub": 199, "price_stars": 175, "label": "1 месяц"},
+    "half_year": {"days": 180, "price_rub": 899, "price_stars": 750, "label": "6 месяцев"},
+    "year": {"days": 365, "price_rub": 1599, "price_stars": 1300, "label": "1 год"},
+}
 
 
 @dataclass
@@ -75,6 +108,50 @@ class RateLimitConfig:
 
 
 @dataclass
+class PaymentConfig:
+    """Контакт для оплаты подписки (username или ссылка t.me)"""
+    contact: str = field(default_factory=lambda: os.getenv("PAYMENT_CONTACT", "").strip())
+    stars_enabled: bool = field(default_factory=lambda: os.getenv("STARS_PAYMENT_ENABLED", "true").lower() == "true")
+
+
+@dataclass
+class NetworkConfig:
+    """Сеть: прокси для Telegram API (нужно в РФ)"""
+    proxy_url: str = field(default_factory=lambda: os.getenv("PROXY_URL", "").strip())
+    telegram_api_server: str = field(default_factory=lambda: os.getenv("TELEGRAM_API_SERVER", "").strip())
+
+
+@dataclass
+class FilterConfig:
+    """Настройки многоступенчатой фильтрации"""
+    min_text_length: int = field(default_factory=lambda: int(os.getenv("FILTER_MIN_TEXT_LENGTH", "150")))
+    max_links: int = field(default_factory=lambda: int(os.getenv("FILTER_MAX_LINKS", "5")))
+    min_llm_confidence: int = field(default_factory=lambda: int(os.getenv("FILTER_MIN_LLM_CONFIDENCE", "60")))
+    min_rule_confidence: int = field(default_factory=lambda: int(os.getenv("FILTER_MIN_RULE_CONFIDENCE", "50")))
+    min_quality_score: int = field(default_factory=lambda: int(os.getenv("FILTER_MIN_QUALITY_SCORE", "20")))
+    simhash_similarity_threshold: float = field(
+        default_factory=lambda: float(os.getenv("FILTER_SIMHASH_THRESHOLD", "0.90"))
+    )
+    embedding_similarity_threshold: float = field(
+        default_factory=lambda: float(os.getenv("FILTER_EMBEDDING_THRESHOLD", "0.90"))
+    )
+    dedup_lookback_days: int = field(default_factory=lambda: int(os.getenv("FILTER_DEDUP_DAYS", "14")))
+    dedup_lookback_count: int = field(default_factory=lambda: int(os.getenv("FILTER_DEDUP_COUNT", "500")))
+
+
+@dataclass
+class LLMConfig:
+    """Настройки LLM для классификации вакансий"""
+    enabled: bool = field(default_factory=lambda: os.getenv("LLM_ENABLED", "false").lower() == "true")
+    api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", "").strip())
+    base_url: str = field(default_factory=lambda: os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip())
+    model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-4o-mini").strip())
+    embedding_model: str = field(default_factory=lambda: os.getenv("LLM_EMBEDDING_MODEL", "text-embedding-3-small").strip())
+    extract_enabled: bool = field(default_factory=lambda: os.getenv("LLM_EXTRACT_ENABLED", "true").lower() == "true")
+    timeout_seconds: int = field(default_factory=lambda: int(os.getenv("LLM_TIMEOUT_SECONDS", "30")))
+
+
+@dataclass
 class Config:
     """Главный конфиг приложения"""
     bot: BotConfig = field(default_factory=BotConfig)
@@ -84,6 +161,10 @@ class Config:
     channel: ChannelConfig = field(default_factory=ChannelConfig)
     parser: ParserConfig = field(default_factory=ParserConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
+    payment: PaymentConfig = field(default_factory=PaymentConfig)
+    filter: FilterConfig = field(default_factory=FilterConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
 
 
 # Глобальный инстанс конфига
@@ -596,6 +677,74 @@ MASS_RECRUITMENT_PATTERNS = [
     r"любой\s+опыт",
     r"любой\s+возраст",
 ]
+
+
+# ===================================
+# МНОГОСТУПЕНЧАТАЯ ФИЛЬТРАЦИЯ
+# ===================================
+
+NOT_VACANCY_PHRASES = [
+    "ищу работу",
+    "ищу проект",
+    "мое резюме",
+    "моё резюме",
+    "ищу команду",
+    "кто ищет разработчика",
+    "посоветуйте специалиста",
+    "посоветуйте фрилансера",
+    "есть ли тут",
+    "кто может помочь",
+    "ищу заказчика",
+    "ищу клиента",
+    "ищу партнера",
+    "ищу партнёра",
+    "резюме",
+    "cv",
+    "curriculum vitae",
+    "мой опыт",
+    "обо мне",
+    "готов выполнить",
+    "предлагаю услуги",
+    r"regex:^ищу\s+(работу|проект|команду|заказчика|клиента|удаленку|фриланс)",
+    r"regex:^(предлагаю|готов)\s+",
+    r"regex:посоветуйте\s+(специалист|фриланс|разработчик|дизайнер)",
+]
+
+WHITELIST_KEYWORDS = [
+    "Python", "Backend", "Frontend", "React", "Vue", "Flutter",
+    "AI", "ML", "LLM", "GPT", "DevOps", "QA", "Data",
+    "JavaScript", "TypeScript", "Node", "Django", "FastAPI",
+    "PostgreSQL", "Docker", "Kubernetes", "iOS", "Android",
+]
+
+BLACKLIST_KEYWORDS = [
+    "казино", "беттинг", "букмекер", "ставки", "гемблинг",
+    "криптоскам", "крипто заработок", "mlm", "пирамида",
+    "арбитраж трафика", "onlyfans", "only fans",
+    "forex", "бинарные опции", "хайп", "инвестиции без риска",
+    "пассивный доход без", "легкие деньги", "заработок без усилий",
+]
+
+
+def get_payment_contact_url() -> str:
+    """Ссылка t.me для оплаты подписки."""
+    contact = config.payment.contact.strip()
+    if not contact:
+        return ""
+    if contact.startswith("http"):
+        return contact
+    username = contact.lstrip("@")
+    return f"https://t.me/{username}"
+
+
+def get_payment_contact_display() -> str:
+    """Отображаемый контакт (@username)."""
+    contact = config.payment.contact.strip()
+    if not contact:
+        return "администратору бота"
+    if contact.startswith("http"):
+        return contact
+    return contact if contact.startswith("@") else f"@{contact}"
 
 
 def is_admin(user_id: int) -> bool:

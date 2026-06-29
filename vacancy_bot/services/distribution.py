@@ -10,9 +10,12 @@ from typing import Optional, List, Dict, Tuple
 from datetime import datetime
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import config, CATEGORIES, MAX_VACANCY_LENGTH
+from config import config, CATEGORIES, get_moderation_chat_id, moderation_enabled
 from database import db
+from parser.filter.text_cleaner import remove_telegra_links
 
 logger = logging.getLogger(__name__)
 
@@ -29,23 +32,28 @@ class VacancyDistributor:
         self._is_running = False
     
     def _clean_hashtags(self, text: str) -> str:
-        """
-        Удаляет все хэштеги из текста вакансии.
-        
-        Args:
-            text: Исходный текст
-            
-        Returns:
-            Текст без хэштегов
-        """
-        # Удаляем все хэштеги (русские и английские)
-        text = re.sub(r'#\w+', '', text)
-        # Удаляем множественные пробелы и переносы строк
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'\n\s*\n', '\n\n', text)
+        """Удаляет хэштеги, сохраняя переносы строк."""
+        text = re.sub(r"#\w+", "", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
-    
-    def _extract_contact(self, text: str) -> Optional[str]:
+
+    def _normalize_username(self, value: str) -> str:
+        return value.lower().lstrip("@").strip()
+
+    def _is_channel_contact(self, contact: str, source: Optional[str]) -> bool:
+        """Контакт совпадает с каналом-источником — не использовать."""
+        if not contact or not source:
+            return False
+        if not contact.startswith("@"):
+            return False
+        contact_user = self._normalize_username(contact)
+        source_user = self._normalize_username(source.replace("https://t.me/", ""))
+        if not contact_user or not source_user:
+            return False
+        return contact_user == source_user
+
+    def _extract_contact(self, text: str, exclude_source: Optional[str] = None) -> Optional[str]:
         """
         Извлекает контакт из текста вакансии.
         Приоритет: @username > телефоны > email.
@@ -65,9 +73,9 @@ class VacancyDistributor:
         if contact_line_match:
             username = contact_line_match.group(1)
             username_lower = username.lower()
-            # Пропускаем ботов и служебные аккаунты
             if not any(skip in username_lower for skip in ['bot', 'admin', 'support', 'help', 'vakansii']):
-                return username
+                if not self._is_channel_contact(username, exclude_source):
+                    return username
         
         # Ищем секцию "Контакты:" и извлекаем все контакты оттуда
         contacts_section_match = re.search(
@@ -83,7 +91,8 @@ class VacancyDistributor:
             for match in telegram_in_section:
                 username = match.lower()
                 if not any(skip in username for skip in ['bot', 'admin', 'support', 'help', 'vakansii']):
-                    return match
+                    if not self._is_channel_contact(match, exclude_source):
+                        return match
             
             # Ищем телефон в секции контактов (приоритет перед email)
             phone_in_section = re.search(
@@ -115,13 +124,12 @@ class VacancyDistributor:
         telegram_matches = re.findall(r'@[\w]+', text)
         for match in telegram_matches:
             username = match.lower()
-            # Пропускаем ботов и служебные аккаунты
             if not any(skip in username for skip in ['bot', 'admin', 'support', 'help', 'vakansii']):
-                return match
-        
-        # Если не нашли нормальный username, берем первый попавшийся (но не Vakansii)
+                if not self._is_channel_contact(match, exclude_source):
+                    return match
+
         for match in telegram_matches:
-            if 'vakansii' not in match.lower():
+            if 'vakansii' not in match.lower() and not self._is_channel_contact(match, exclude_source):
                 return match
         
         # Ищем телефоны по всему тексту (формат +7, 8, или без кода)
@@ -966,86 +974,97 @@ class VacancyDistributor:
         category_id = vacancy.get("category", "other")
         category_data = CATEGORIES.get(category_id, CATEGORIES["other"])
         
-        # Получаем исходный текст
-        text = vacancy.get("text", "")
-        
-        # Очищаем хэштеги из текста
+        source = vacancy.get("source", "")
+
+        text = (vacancy.get("text") or vacancy.get("original_text") or "").strip()
+        if not text:
+            return ""
+
+        text = remove_telegra_links(text)
+
+        # Удаляем ссылки на фото/изображения (включая с открывающей скобкой)
+        text = re.sub(
+            r'[(\[]*https?://\S+?\.(?:jpg|jpeg|png|webp|gif|bmp|svg|tiff)(?:\?\S*)?[)\]]*',
+            '', text, flags=re.IGNORECASE,
+        )
+        # Удаляем ссылки на хостинги изображений (teletype, telegraph, imgur и др.)
+        text = re.sub(
+            r'[(\[]*https?://(?:i\.)?(?:imgur\.com|ibb\.co|postimg\.cc|imgbb\.com|imageban\.ru|'
+            r'pic\.re|prnt\.sc|prntscr\.com|joxi\.ru|gyazo\.com|'
+            r'img\d*\.teletype\.in|teletype\.in/files|'
+            r'telegraph\.controller\.bot|telegraph\.[\w.]+/files|'
+            r'sun\d*-\d+\.userapi\.com|pp\.userapi\.com|vk\.com/photo|'
+            r'disk\.yandex\.\w+/\S+|drive\.google\.com/\S+/d/)\S*[)\]]*',
+            '', text, flags=re.IGNORECASE,
+        )
+        # Markdown-ссылки на изображения [Текст](image_url) → сохраняем "Текст"
+        text = re.sub(
+            r'\[([^\]]+)\]\(https?://\S+?\.(?:jpg|jpeg|png|webp|gif)\S*\)',
+            r'\1', text, flags=re.IGNORECASE,
+        )
+        # Markdown-ссылки с текстом на хостинги/telegraph [Текст](url) → сохраняем "Текст"
+        text = re.sub(
+            r'\[([^\]]+)\]\(https?://(?:telegraph\.\S+|img\d*\.teletype\.\S+|teletype\.in/files)\S*\)',
+            r'\1', text, flags=re.IGNORECASE,
+        )
+        # Пустые markdown-ссылки [](url) → удаляем целиком
+        text = re.sub(
+            r'\[\]\(https?://\S+?\)',
+            '', text, flags=re.IGNORECASE,
+        )
+        # Убираем оставшиеся пустые скобки []
+        text = re.sub(r'\[\s*\]', '', text)
+
+        # Удаляем декоративные разделители (➖➖➖, ━━━, ═══, ——— и т.д.)
+        text = re.sub(r'[➖━═—–\-]{3,}', '', text)
+
+        # Удаляем рекламные/спонсорские футеры
+        ad_footer_patterns = [
+            r'📢?\s*разместить\s+(?:рекламу|вакансию)[^\n]*',
+            r'\[?разместить\s+(?:рекламу|вакансию)[^\n]*',
+            r'при\s+поддержк[ие]\s+[^\n]*',
+            r'реклама\s+в\s+канал[ае][^\n]*',
+            r'по\s+вопросам\s+рекламы[^\n]*',
+            r'(?:наш|наши)\s+(?:канал[ы]?|чат|бот)[^\n]*подпис[^\n]*',
+            r'подписывайтесь\s+на\s+(?:наш|канал)[^\n]*',
+        ]
+        for pattern in ad_footer_patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+
+        # Очищаем пустые строки, оставшиеся после удаления
+        text = re.sub(r'[ \t]+\n', '\n', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = text.strip()
+
+        if source:
+            source_user = self._normalize_username(source.replace("https://t.me/", ""))
+            if source_user:
+                text = re.sub(
+                    rf"(?i)\n*контакт[ы]?(?:\s+для\s+отклика)?[:]\s*@{re.escape(source_user)}\s*",
+                    "",
+                    text,
+                ).strip()
+
         text = self._clean_hashtags(text)
-        
-        # Извлекаем контакт
-        contact = self._extract_contact(text)
-        
-        # Умное сокращение текста до MAX_VACANCY_LENGTH
-        if len(text) > MAX_VACANCY_LENGTH:
-            text = self._trim_vacancy_text(text, contact)
-            # Если после сокращения контакт пропал, извлекаем заново
-            if not contact:
-                contact = self._extract_contact(text)
-        
-        # Форматируем текст как цитату
+        contact = self._extract_contact(text, exclude_source=source)
+
+        # Вакансии без контакта для отклика — не отправляем
+        if not contact:
+            logger.info(
+                "⛔ Вакансия %s пропущена: нет контакта для отклика",
+                vacancy.get("id", "?"),
+            )
+            return ""
+
         quoted_text = self._format_text_as_quote(text)
-        
-        # Добавляем контакты в конец цитаты
-        if contact:
-            # Убеждаемся, что закрывающий тег </blockquote> присутствует
-            if '</blockquote>' not in quoted_text:
-                logger.warning(f"Отсутствует закрывающий тег </blockquote>, добавляем его")
-                quoted_text = quoted_text.rstrip() + '</blockquote>'
-            
-            # Удаляем контакт из основного текста если он там есть
-            # ВАЖНО: удаляем контакт ТОЛЬКО из содержимого blockquote, не затрагивая сам тег
-            contact_escaped = re.escape(contact)
-            
-            # Извлекаем содержимое blockquote
-            blockquote_match = re.match(r'<blockquote>(.*?)</blockquote>', quoted_text, re.DOTALL)
+        if not quoted_text or quoted_text == "<blockquote></blockquote>":
+            quoted_text = f"<blockquote>{text}</blockquote>"
+
+        if contact and contact not in text:
+            blockquote_match = re.match(r"<blockquote>(.*?)</blockquote>", quoted_text, re.DOTALL)
             if blockquote_match:
-                blockquote_content = blockquote_match.group(1)
-                
-                # Удаляем строки с контактом в разных форматах из содержимого
-                contact_patterns = [
-                    rf'(?:контакт[ы]?\s+для\s+отклика|контакт[ы]?)[:]\s*{contact_escaped}',
-                    rf'{contact_escaped}\s*$',  # Контакт в конце строки
-                    rf'^.*?{contact_escaped}.*?$',  # Строка содержащая только контакт
-                ]
-                
-                for pattern in contact_patterns:
-                    blockquote_content = re.sub(pattern, '', blockquote_content, flags=re.IGNORECASE | re.MULTILINE)
-                
-                # Удаляем пустые строки, оставшиеся после удаления контакта
-                blockquote_content = re.sub(r'\n\s*\n\s*\n+', '\n\n', blockquote_content)
-                blockquote_content = re.sub(r'^\s*\n', '', blockquote_content, flags=re.MULTILINE)
-                blockquote_content = blockquote_content.strip()
-                
-                # Добавляем контакт в конец содержимого
-                # Форматируем контакт в зависимости от типа
-                if contact.startswith('@'):
-                    contact_formatted = contact
-                elif contact.startswith('+') or (contact[0].isdigit() if contact else False):
-                    # Телефон - форматируем для читаемости
-                    contact_formatted = contact
-                elif '@' in contact:
-                    # Email
-                    contact_formatted = contact
-                else:
-                    contact_formatted = contact
-                
-                if blockquote_content:
-                    blockquote_content += f"\n\n<b>Контакты для отклика:</b> {contact_formatted}"
-                else:
-                    blockquote_content = f"<b>Контакты для отклика:</b> {contact_formatted}"
-                
-                # Формируем финальный quoted_text с закрывающим тегом
-                quoted_text = f"<blockquote>{blockquote_content}</blockquote>"
-            else:
-                # Если структура blockquote нарушена, пытаемся восстановить
-                logger.error(f"Некорректная структура blockquote в quoted_text, пытаемся восстановить")
-                # Удаляем все теги blockquote и создаем заново
-                content = re.sub(r'</?blockquote>', '', quoted_text)
-                content = content.strip()
-                if content:
-                    content += f"\n\n<b>Контакты для отклика:</b> {contact}"
-                else:
-                    content = f"<b>Контакты для отклика:</b> {contact}"
+                content = blockquote_match.group(1).strip()
+                content += f"\n\n<b>Контакты для отклика:</b> {contact}"
                 quoted_text = f"<blockquote>{content}</blockquote>"
         
         # Генерируем хэштеги
@@ -1064,6 +1083,51 @@ class VacancyDistributor:
         # Не обрезаем сообщение - если оно длиннее 1024 символов,
         # будем отправлять фото отдельно, а текст отдельным сообщением
         return message.strip()
+
+    async def _send_html_messages(self, tg_id: int, message_text: str) -> None:
+        """Отправить длинный HTML-текст частями без обрезки."""
+        max_len = 4096
+        if len(message_text) <= max_len:
+            await self.bot.send_message(
+                chat_id=tg_id,
+                text=message_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
+        parts = message_text.split("\n\n")
+        chunk = ""
+        for part in parts:
+            candidate = f"{chunk}\n\n{part}".strip() if chunk else part
+            if len(candidate) <= max_len:
+                chunk = candidate
+                continue
+            if chunk:
+                await self.bot.send_message(
+                    chat_id=tg_id,
+                    text=chunk,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            if len(part) <= max_len:
+                chunk = part
+            else:
+                for i in range(0, len(part), max_len):
+                    await self.bot.send_message(
+                        chat_id=tg_id,
+                        text=part[i:i + max_len],
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                chunk = ""
+        if chunk:
+            await self.bot.send_message(
+                chat_id=tg_id,
+                text=chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
     
     async def send_vacancy_to_user(
         self, 
@@ -1099,118 +1163,28 @@ class VacancyDistributor:
             
             # Форматируем и отправляем
             message_text = self.format_vacancy(vacancy)
-            
-            # Проверяем что текст не пустой
+
             if not message_text or len(message_text.strip()) < 10:
-                logger.warning(f"Пустой текст вакансии {vacancy_id}")
-                return False
-            
-            # Проверяем наличие фото
-            has_photo = vacancy.get("has_photo", False)
-            photo_file_id = vacancy.get("photo_file_id")
-            photo_message_id = vacancy.get("photo_message_id")
-            source = vacancy.get("source")
-            
-            logger.debug(
-                f"Вакансия {vacancy_id}: has_photo={has_photo}, "
-                f"photo_file_id={bool(photo_file_id)}, "
-                f"photo_message_id={photo_message_id}, source={source}"
-            )
-            
-            # Если есть file_id фото - отправляем с фото
-            if photo_file_id:
-                try:
-                    logger.debug(f"Отправка вакансии {vacancy_id} с file_id фото")
-                    # Проверяем длину caption (максимум 1024 символа для Telegram)
-                    max_caption_length = 1024
-                    if len(message_text) > max_caption_length:
-                        # Если текст длиннее - отправляем фото без caption, а текст отдельным сообщением
-                        await self.bot.send_photo(
-                            chat_id=tg_id,
-                            photo=photo_file_id
-                        )
-                        # Отправляем текст отдельным сообщением
-                        await self.bot.send_message(
-                            chat_id=tg_id,
-                            text=message_text,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True
-                        )
-                    else:
-                        # Если текст помещается в caption - отправляем вместе с фото
-                        await self.bot.send_photo(
-                            chat_id=tg_id,
-                            photo=photo_file_id,
-                            caption=message_text,
-                            parse_mode="HTML"
-                        )
-                except Exception as e:
-                    logger.error(f"Ошибка отправки фото вакансии {vacancy_id} -> {tg_id}: {e}")
-                    # Пробуем отправить без фото
-                    await self._send_with_default_photo(tg_id, message_text)
-            # Если фото есть но file_id нет - пытаемся загрузить через Telethon
-            elif has_photo and photo_message_id and source:
-                logger.info(
-                    f"Загрузка фото для вакансии {vacancy_id} из {source}, "
-                    f"message_id={photo_message_id}"
-                )
-                try:
-                    if not self.parser or not self.parser.is_authorized:
-                        logger.warning(f"Telethon не авторизован, отправляем без фото")
-                        await self._send_with_default_photo(tg_id, message_text)
-                    else:
-                        photo_file_id = await self._download_photo_from_telethon(
-                            source,
-                            photo_message_id
-                        )
-                        if photo_file_id:
-                            logger.info(f"Фото загружено, file_id получен для вакансии {vacancy_id}")
-                            await db.update_vacancy_photo(vacancy_id, photo_file_id)
-                            # Проверяем длину caption (максимум 1024 символа для Telegram)
-                            max_caption_length = 1024
-                            if len(message_text) > max_caption_length:
-                                # Если текст длиннее - отправляем фото без caption, а текст отдельным сообщением
-                                await self.bot.send_photo(
-                                    chat_id=tg_id,
-                                    photo=photo_file_id
-                                )
-                                # Отправляем текст отдельным сообщением
-                                await self.bot.send_message(
-                                    chat_id=tg_id,
-                                    text=message_text,
-                                    parse_mode="HTML",
-                                    disable_web_page_preview=True
-                                )
-                            else:
-                                # Если текст помещается в caption - отправляем вместе с фото
-                                await self.bot.send_photo(
-                                    chat_id=tg_id,
-                                    photo=photo_file_id,
-                                    caption=message_text,
-                                    parse_mode="HTML"
-                                )
-                        else:
-                            logger.warning(f"Не удалось загрузить фото для вакансии {vacancy_id}")
-                            # Если не удалось загрузить - отправляем с дефолтным фото
-                            await self._send_with_default_photo(tg_id, message_text)
-                except Exception as e:
-                    logger.error(f"Ошибка загрузки фото для вакансии {vacancy_id}: {e}")
-                    logger.error(f"Тип ошибки: {type(e).__name__}, Детали: {str(e)[:300]}")
-                    # При ошибке отправляем с дефолтным фото
-                    await self._send_with_default_photo(tg_id, message_text)
-            # Если фото нет - используем дефолтное
-            else:
-                logger.debug(f"Фото нет для вакансии {vacancy_id}, используем дефолтное")
-                await self._send_with_default_photo(tg_id, message_text)
+                raw = (vacancy.get("text") or vacancy.get("original_text") or "").strip()
+                if len(raw) >= 10:
+                    # Добавляем заголовок к сырому тексту
+                    category_id = vacancy.get("category", "other")
+                    category_data = CATEGORIES.get(category_id, CATEGORIES["other"])
+                    message_text = (
+                        "🆕 Новая вакансия\n"
+                        f"Направление: {category_data['name']}\n\n"
+                        f"<blockquote>{raw}</blockquote>"
+                    )
+                else:
+                    logger.warning(f"Пустой текст вакансии {vacancy_id}")
+                    return False
+
+            await self._send_with_default_photo(tg_id, message_text)
             
             # Записываем в БД
             await db.record_sent_vacancy(user_id, vacancy_id)
             await db.record_send_log(user_id)
-            
-            # Проверяем статус x2 для логирования
-            is_x2 = await db.is_user_x2(tg_id)
-            user_type = "x2" if is_x2 else "обычный"
-            logger.debug(f"✅ Вакансия {vacancy_id} отправлена {user_type} пользователю {tg_id}")
+            logger.debug(f"✅ Вакансия {vacancy_id} отправлена пользователю {tg_id}")
             return True
             
         except Exception as e:
@@ -1233,21 +1207,14 @@ class VacancyDistributor:
                 logger.info(f"Чат не найден для {tg_id}")
                 
             elif "message is too long" in error_msg or "caption is too long" in error_msg:
-                logger.warning(f"Сообщение слишком длинное для {tg_id}, обрезаем")
-                # Пробуем отправить обрезанное сообщение
+                logger.warning(f"Сообщение слишком длинное для {tg_id}, отправляем частями")
                 try:
-                    short_text = message_text[:1024] + "..."
-                    await self.bot.send_message(
-                        chat_id=tg_id,
-                        text=short_text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
+                    await self._send_html_messages(tg_id, message_text)
                     await db.record_sent_vacancy(user_id, vacancy_id)
                     await db.record_send_log(user_id)
                     return True
                 except Exception as e2:
-                    logger.error(f"Ошибка отправки обрезанного сообщения {vacancy_id} -> {tg_id}: {e2}")
+                    logger.error(f"Ошибка отправки частями {vacancy_id} -> {tg_id}: {e2}")
             else:
                 logger.error(f"Ошибка отправки вакансии {vacancy_id} -> {tg_id}: {e}")
                 logger.error(f"Тип ошибки: {type(e).__name__}, Сообщение: {str(e)[:200]}")
@@ -1281,47 +1248,33 @@ class VacancyDistributor:
         )
         
         success_count = 0
-        x2_count = 0
-        regular_count = 0
-        skipped_regular = 0
-        skipped_x2 = 0
-        import random
-        
+        skipped_no_subscription = 0
+
         for user in users:
-            # Проверяем статус x2 пользователя
-            is_x2 = await db.is_user_x2(user["tg_id"])
-            
-            # Обычные пользователи получают 90% вакансий, x2 - 95%
-            # Это обеспечивает более справедливое распределение
-            if not is_x2:
-                # Пропускаем 10% вакансий для обычных пользователей (отправляем 90%)
-                if random.random() < 0.1:
-                    skipped_regular += 1
-                    logger.debug(f"⏭ Пропуск вакансии {vacancy_id} для обычного пользователя {user['tg_id']}")
-                    continue
-                regular_count += 1
-            else:
-                # x2 пользователи получают 95% вакансий (пропускаем 5%)
-                if random.random() < 0.05:
-                    skipped_x2 += 1
-                    logger.debug(f"⏭ Пропуск вакансии {vacancy_id} для x2 пользователя {user['tg_id']}")
-                    continue
-                x2_count += 1
-            
+            if not await db.has_active_subscription(user["tg_id"]):
+                skipped_no_subscription += 1
+                logger.debug(
+                    "Пропуск вакансии %s: нет подписки у %s",
+                    vacancy_id,
+                    user["tg_id"],
+                )
+                continue
+
             success = await self.send_vacancy_to_user(user, vacancy)
             if success:
                 success_count += 1
-                if is_x2:
-                    logger.debug(f"✅ Вакансия {vacancy_id} отправлена x2 пользователю {user['tg_id']}")
-                else:
-                    logger.debug(f"✅ Вакансия {vacancy_id} отправлена обычному пользователю {user['tg_id']}")
-            
-            # Пауза между отправками (anti-flood)
+
             await asyncio.sleep(config.rate_limit.min_delay_seconds)
-        
+
+        if skipped_no_subscription:
+            logger.info(
+                "Вакансия %s: пропущено %s пользователей без подписки",
+                vacancy_id,
+                skipped_no_subscription,
+            )
+
         logger.info(
-            f"📊 Вакансия {vacancy_id}: отправлено {success_count} ({regular_count} обычных, {x2_count} x2), "
-            f"пропущено {skipped_regular} обычных, {skipped_x2} x2"
+            f"📊 Вакансия {vacancy_id}: отправлено {success_count} из {len(users)}"
         )
         
         # Отмечаем вакансию как разосланную
@@ -1333,6 +1286,80 @@ class VacancyDistributor:
         )
         
         return success_count
+
+    def _moderation_keyboard(self, vacancy_id: int):
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(
+                text="✅ Принять",
+                callback_data=f"vac_mod:approve:{vacancy_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отклонить",
+                callback_data=f"vac_mod:reject:{vacancy_id}",
+            ),
+        )
+        return builder.as_markup()
+
+    def _format_moderation_preview(self, vacancy: Dict) -> str:
+        category_id = vacancy.get("category", "other")
+        cat = CATEGORIES.get(category_id, CATEGORIES["other"])
+        raw = (vacancy.get("text") or vacancy.get("original_text") or "").strip()
+        raw = remove_telegra_links(raw)
+        if len(raw) > 3500:
+            raw = raw[:3500] + "..."
+        return (
+            f"📥 <b>Модерация вакансии</b> #{vacancy['id']}\n"
+            f"Источник: {vacancy.get('source', '?')}\n"
+            f"Категория: {cat['name']}\n"
+            f"Quality: {vacancy.get('quality_score', 0)}\n\n"
+            f"{raw}"
+        )
+
+    async def send_pending_to_moderation(self) -> int:
+        """Отправить новые вакансии в чат модерации."""
+        if not moderation_enabled():
+            return 0
+
+        chat_id = get_moderation_chat_id()
+        if not chat_id:
+            return 0
+
+        pending = await db.get_vacancies_pending_moderation(limit=30)
+        sent = 0
+
+        for vacancy in pending:
+            try:
+                preview = self._format_moderation_preview(vacancy)
+                markup = self._moderation_keyboard(vacancy["id"])
+                default_photo = await db.get_default_photo()
+
+                if default_photo:
+                    await self.bot.send_photo(chat_id=chat_id, photo=default_photo)
+
+                msg = await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=preview,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+                await db.set_vacancy_moderation_status(
+                    vacancy["id"],
+                    "pending",
+                    moderation_chat_message_id=msg.message_id,
+                )
+                sent += 1
+            except Exception as e:
+                logger.error(
+                    "Ошибка отправки вакансии %s в модерацию: %s",
+                    vacancy.get("id"),
+                    e,
+                )
+
+        if sent:
+            logger.info("📥 Отправлено в модерацию: %s вакансий", sent)
+        return sent
     
     async def distribute_all_pending(self) -> tuple:
         """
@@ -1559,90 +1586,39 @@ class VacancyDistributor:
             return None
     
     async def _send_with_default_photo(self, tg_id: int, message_text: str):
-        """Отправить сообщение с дефолтным фото или без фото"""
+        """Отправляет дефолтное фото с текстом в одном сообщении (caption).
+
+        Telegram ограничивает caption до 1024 символов.
+        Если текст длиннее — фото + текст отдельными сообщениями.
+        """
         default_photo_id = await db.get_default_photo()
-        
+
         if default_photo_id:
-            try:
-                # Проверяем длину caption (максимум 1024 символа для Telegram)
-                max_caption_length = 1024
-                if len(message_text) > max_caption_length:
-                    # Если текст длиннее - отправляем фото без caption, а текст отдельным сообщением
-                    logger.debug(f"Отправка с дефолтным фото (без caption) пользователю {tg_id}")
-                    await self.bot.send_photo(
-                        chat_id=tg_id,
-                        photo=default_photo_id
-                    )
-                    # Отправляем текст отдельным сообщением
-                    await self.bot.send_message(
-                        chat_id=tg_id,
-                        text=message_text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                else:
-                    # Если текст помещается в caption - отправляем вместе с фото
-                    logger.debug(f"Отправка с дефолтным фото пользователю {tg_id}")
+            if len(message_text) <= 1024:
+                # Фото + текст одним сообщением
+                try:
                     await self.bot.send_photo(
                         chat_id=tg_id,
                         photo=default_photo_id,
                         caption=message_text,
-                        parse_mode="HTML"
-                    )
-                logger.debug(f"✅ Сообщение с дефолтным фото отправлено {tg_id}")
-            except Exception as e:
-                error_msg = str(e).lower()
-                error_type = type(e).__name__
-                logger.error(f"❌ Ошибка отправки с дефолтным фото {tg_id}: {error_type}: {str(e)[:200]}")
-                
-                # Если ошибка с фото - пробуем отправить без фото
-                if "photo" in error_msg or "file" in error_msg:
-                    logger.warning(f"Пробуем отправить без фото для {tg_id}")
-                    try:
-                        text = message_text[:4096] if len(message_text) > 4096 else message_text
-                        await self.bot.send_message(
-                            chat_id=tg_id,
-                            text=text,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True
-                        )
-                        logger.debug(f"✅ Сообщение без фото отправлено {tg_id}")
-                    except Exception as e2:
-                        logger.error(f"❌ Ошибка отправки без фото {tg_id}: {type(e2).__name__}: {str(e2)[:200]}")
-                        raise e2
-                else:
-                    raise e
-                
-                # Если не получилось - отправляем без фото
-                try:
-                    # Обрезаем текст если слишком длинный
-                    text = message_text[:4096] if len(message_text) > 4096 else message_text
-                    logger.debug(f"Попытка отправить текст без фото пользователю {tg_id}")
-                    await self.bot.send_message(
-                        chat_id=tg_id,
-                        text=text,
                         parse_mode="HTML",
-                        disable_web_page_preview=True
                     )
-                    logger.debug(f"✅ Текст отправлен без фото {tg_id}")
-                except Exception as e2:
-                    logger.error(f"Ошибка отправки текста {tg_id}: {e2}")
-                    logger.error(f"Тип ошибки: {type(e2).__name__}, Детали: {str(e2)[:300]}")
-                    raise e2
-        else:
-            # Если дефолтного фото нет - отправляем без фото
+                    return
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "caption" in error_msg or "too long" in error_msg:
+                        logger.warning(
+                            "Caption слишком длинный для %s, отправляем раздельно", tg_id
+                        )
+                    else:
+                        logger.error(f"Ошибка send_photo с caption {tg_id}: {e}")
+            # Текст длиннее 1024 — фото отдельно, текст отдельно
             try:
-                # Обрезаем текст если слишком длинный
-                text = message_text[:4096] if len(message_text) > 4096 else message_text
-                logger.debug(f"Отправка текста без фото пользователю {tg_id} (дефолтного фото нет)")
-                await self.bot.send_message(
-                    chat_id=tg_id,
-                    text=text,
-                    disable_web_page_preview=True
-                )
-                logger.debug(f"✅ Текст отправлен {tg_id}")
+                await self.bot.send_photo(chat_id=tg_id, photo=default_photo_id)
             except Exception as e:
-                logger.error(f"Ошибка отправки сообщения {tg_id}: {e}")
-                logger.error(f"Тип ошибки: {type(e).__name__}, Детали: {str(e)[:300]}")
-                raise
+                logger.error(f"Ошибка отправки дефолтного фото {tg_id}: {e}")
+        else:
+            logger.warning(f"Дефолтное фото не задано — отправляем только текст {tg_id}")
+
+        await self._send_html_messages(tg_id, message_text)
 

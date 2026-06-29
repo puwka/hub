@@ -11,7 +11,12 @@ from urllib.parse import quote
 
 import httpx
 
-from config import config
+from config import config, REFERRAL_BONUS_DAYS, WELCOME_SUBSCRIPTION_DAYS, REVIEW_BONUS_DAYS
+from utils.subscription import (
+    SUBSCRIPTION_UNTIL_FIELD,
+    is_subscription_active,
+    parse_subscription_until,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +89,14 @@ class SupabaseClient:
         first_name: Optional[str] = None,
         last_name: Optional[str] = None,
         referred_by: Optional[int] = None
-    ) -> Optional[Dict]:
-        """Создать нового пользователя"""
+    ) -> tuple[Optional[Dict], bool]:
+        """Создать нового пользователя. Возвращает (user, referral_bonus_awarded)."""
         import secrets
-        # Генерируем уникальный реферальный код
         referral_code = secrets.token_urlsafe(8)[:12].upper()
-        
+        referral_awarded = False
+        now = datetime.now(timezone.utc)
+        welcome_until = (now + timedelta(days=WELCOME_SUBSCRIPTION_DAYS)).isoformat()
+
         try:
             data = {
                 "tg_id": tg_id,
@@ -100,19 +107,25 @@ class SupabaseClient:
                 "is_subscribed": False,
                 "is_active": True,
                 "referral_code": referral_code,
-                "referral_count": 0
+                "referral_count": 0,
+                SUBSCRIPTION_UNTIL_FIELD: welcome_until,
             }
             result = self._request("POST", "users", json=data)
-            logger.info(f"✅ Создан пользователь: {tg_id} с реферальным кодом {referral_code}")
-            
-            # Если пользователь пришел по реферальной ссылке
+            logger.info(
+                "✅ Создан пользователь: %s, подписка %s дн. до %s",
+                tg_id,
+                WELCOME_SUBSCRIPTION_DAYS,
+                welcome_until,
+            )
+
             if referred_by:
-                await self.add_referral(referred_by, tg_id)
-            
-            return result[0] if result else None
+                referral_awarded = await self.add_referral(referred_by, tg_id)
+
+            user = result[0] if result else None
+            return user, referral_awarded
         except Exception as e:
             logger.error(f"Ошибка создания пользователя {tg_id}: {e}")
-            return None
+            return None, False
     
     async def get_or_create_user(
         self,
@@ -121,14 +134,16 @@ class SupabaseClient:
         first_name: Optional[str] = None,
         last_name: Optional[str] = None,
         referred_by: Optional[int] = None
-    ) -> Optional[Dict]:
-        """Получить или создать пользователя"""
+    ) -> tuple[Optional[Dict], bool]:
+        """Получить или создать пользователя. Возвращает (user, referral_bonus_awarded)."""
         user = await self.get_user(tg_id)
         if user:
-            # Если пользователь уже существует, но пришел по реферальной ссылке
+            awarded = False
             if referred_by:
-                await self.add_referral(referred_by, tg_id)
-            return user
+                awarded = await self.add_referral(referred_by, tg_id)
+            if not user.get(SUBSCRIPTION_UNTIL_FIELD):
+                await self.extend_subscription(tg_id, days=WELCOME_SUBSCRIPTION_DAYS)
+            return user, awarded
         return await self.create_user(tg_id, username, first_name, last_name, referred_by)
     
     async def update_user_categories(self, tg_id: int, categories: List[str]) -> bool:
@@ -223,8 +238,11 @@ class SupabaseClient:
     
     async def vacancy_exists(self, text: str) -> bool:
         """Проверить существует ли вакансия (по хешу)"""
+        return await self.vacancy_exists_by_hash(self._hash_text(text))
+
+    async def vacancy_exists_by_hash(self, text_hash: str) -> bool:
+        """Проверить существует ли вакансия по готовому хешу"""
         try:
-            text_hash = self._hash_text(text)
             result = self._request(
                 "GET",
                 f"vacancies?text_hash=eq.{text_hash}&select=id"
@@ -233,7 +251,7 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Ошибка проверки вакансии: {e}")
             return True
-    
+
     async def create_vacancy(
         self,
         text: str,
@@ -241,37 +259,234 @@ class SupabaseClient:
         source: str,
         source_message_id: Optional[int] = None,
         has_photo: bool = False,
-        photo_message_id: Optional[int] = None
+        photo_message_id: Optional[int] = None,
+        original_text: Optional[str] = None,
+        title: Optional[str] = None,
+        company: Optional[str] = None,
+        salary: Optional[str] = None,
+        employment: Optional[str] = None,
+        location: Optional[str] = None,
+        stack: Optional[List] = None,
+        contacts: Optional[List] = None,
+        remote: Optional[bool] = None,
+        quality_score: int = 0,
+        simhash: Optional[str] = None,
+        embedding: Optional[List] = None,
+        filter_confidence: Optional[int] = None,
+        filter_reason: Optional[str] = None,
+        text_hash: Optional[str] = None,
+        moderation_status: Optional[str] = None,
     ) -> Optional[Dict]:
         """Создать новую вакансию"""
         try:
-            text_hash = self._hash_text(text)
-            
-            if await self.vacancy_exists(text):
-                logger.debug(f"Вакансия уже существует (hash: {text_hash[:16]}...)")
+            from config import moderation_enabled
+
+            th = text_hash or self._hash_text(text)
+
+            if await self.vacancy_exists_by_hash(th):
+                logger.debug(f"Вакансия уже существует (hash: {th[:16]}...)")
                 return None
-            
+
+            if moderation_status is None:
+                moderation_status = "pending" if moderation_enabled() else "approved"
+
             data = {
                 "text": text,
                 "category": category,
                 "source": source,
                 "source_message_id": source_message_id,
-                "text_hash": text_hash,
+                "text_hash": th,
                 "is_sent": False,
                 "has_photo": has_photo,
-                "photo_message_id": photo_message_id
+                "photo_message_id": photo_message_id,
+                "original_text": original_text,
+                "title": title,
+                "company": company,
+                "salary": salary,
+                "employment": employment,
+                "location": location,
+                "stack": stack or [],
+                "contacts": contacts or [],
+                "remote": remote if remote is not None else False,
+                "quality_score": quality_score,
+                "simhash": simhash,
+                "filter_confidence": filter_confidence,
+                "filter_reason": filter_reason,
+                "moderation_status": moderation_status,
             }
+            if embedding:
+                data["embedding"] = embedding
+
             result = self._request("POST", "vacancies", json=data)
-            logger.info(f"✅ Создана вакансия: {category} из {source}")
+            logger.info(
+                f"✅ Создана вакансия: {category} из {source} (quality={quality_score})"
+            )
             return result[0] if result else None
         except Exception as e:
             logger.error(f"Ошибка создания вакансии: {e}")
             return None
+
+    async def get_recent_vacancy_fingerprints(
+        self, limit: int = 500, days: int = 14
+    ) -> List[Dict]:
+        """Недавние вакансии для dedup (simhash + embedding)."""
+        try:
+            from datetime import datetime, timedelta, timezone
+            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            endpoint = (
+                f"vacancies?created_at=gte.{since}"
+                f"&order=created_at.desc&limit={limit}"
+                f"&select=id,simhash,embedding,text_hash"
+            )
+            return self._request("GET", endpoint) or []
+        except Exception as e:
+            logger.error(f"Ошибка загрузки fingerprints: {e}")
+            return []
+
+    async def log_parse_filter(self, data: Dict[str, Any]) -> None:
+        """Записать лог решения фильтра."""
+        try:
+            self._request("POST", "parse_filter_logs", json=data)
+        except Exception as e:
+            logger.debug(f"Не удалось записать parse_filter_log: {e}")
+
+    async def increment_parse_metrics(
+        self,
+        source: str,
+        received: int = 0,
+        saved: int = 0,
+        rejected: int = 0,
+        duplicates: int = 0,
+        quality_score: int = 0,
+    ) -> None:
+        """Обновить дневные метрики и качество источника."""
+        try:
+            from datetime import date
+            today = date.today().isoformat()
+
+            existing = self._request(
+                "GET",
+                f"parse_metrics?date=eq.{today}&select=*"
+            )
+            if existing:
+                row = existing[0]
+                q_sum = row.get("quality_score_sum", 0) + (quality_score if saved else 0)
+                q_cnt = row.get("quality_score_count", 0) + (1 if saved and quality_score else 0)
+                avg = q_sum / q_cnt if q_cnt else 0
+                self._request(
+                    "PATCH",
+                    f"parse_metrics?date=eq.{today}",
+                    json={
+                        "messages_received": row.get("messages_received", 0) + received,
+                        "vacancies_saved": row.get("vacancies_saved", 0) + saved,
+                        "vacancies_rejected": row.get("vacancies_rejected", 0) + rejected,
+                        "duplicates_rejected": row.get("duplicates_rejected", 0) + duplicates,
+                        "quality_score_sum": q_sum,
+                        "quality_score_count": q_cnt,
+                        "avg_quality_score": round(avg, 2),
+                        "updated_at": "now()",
+                    },
+                )
+            else:
+                self._request(
+                    "POST",
+                    "parse_metrics",
+                    json={
+                        "date": today,
+                        "messages_received": received,
+                        "vacancies_saved": saved,
+                        "vacancies_rejected": rejected,
+                        "duplicates_rejected": duplicates,
+                        "quality_score_sum": quality_score if saved else 0,
+                        "quality_score_count": 1 if saved and quality_score else 0,
+                        "avg_quality_score": float(quality_score) if saved else 0,
+                    },
+                )
+
+            src = self._request(
+                "GET",
+                f"parse_source_quality?source_id=eq.{source}&select=*"
+            )
+            if src:
+                row = src[0]
+                q_sum = row.get("quality_score_sum", 0) + (quality_score if saved else 0)
+                q_cnt = row.get("quality_score_count", 0) + (1 if saved and quality_score else 0)
+                avg = q_sum / q_cnt if q_cnt else 0
+                self._request(
+                    "PATCH",
+                    f"parse_source_quality?source_id=eq.{source}",
+                    json={
+                        "messages_total": row.get("messages_total", 0) + received,
+                        "saved_total": row.get("saved_total", 0) + saved,
+                        "rejected_total": row.get("rejected_total", 0) + rejected,
+                        "duplicates_total": row.get("duplicates_total", 0) + duplicates,
+                        "quality_score_sum": q_sum,
+                        "quality_score_count": q_cnt,
+                        "avg_quality_score": round(avg, 2),
+                        "updated_at": "now()",
+                    },
+                )
+            else:
+                self._request(
+                    "POST",
+                    "parse_source_quality",
+                    json={
+                        "source_id": source,
+                        "messages_total": received,
+                        "saved_total": saved,
+                        "rejected_total": rejected,
+                        "duplicates_total": duplicates,
+                        "quality_score_sum": quality_score if saved else 0,
+                        "quality_score_count": 1 if saved and quality_score else 0,
+                        "avg_quality_score": float(quality_score) if saved else 0,
+                    },
+                )
+        except Exception as e:
+            logger.debug(f"Не удалось обновить parse_metrics: {e}")
+
+    async def get_filter_metrics(self) -> Dict[str, Any]:
+        """Метрики фильтрации для dashboard."""
+        try:
+            from datetime import date
+            today = date.today().isoformat()
+
+            today_metrics = self._request(
+                "GET", f"parse_metrics?date=eq.{today}&select=*"
+            )
+            today_row = today_metrics[0] if today_metrics else {}
+
+            all_metrics = self._request(
+                "GET",
+                "parse_metrics?order=date.desc&limit=7&select=*"
+            ) or []
+
+            top_sources = self._request(
+                "GET",
+                "parse_source_quality?order=avg_quality_score.desc&limit=5&select=*"
+            ) or []
+
+            recent_logs = self._request(
+                "GET",
+                "parse_filter_logs?order=created_at.desc&limit=5&select=decision,stage,reason,source"
+            ) or []
+
+            return {
+                "today": today_row,
+                "week": all_metrics,
+                "top_sources": top_sources,
+                "recent_logs": recent_logs,
+            }
+        except Exception as e:
+            logger.error(f"Ошибка get_filter_metrics: {e}")
+            return {}
     
     async def get_unsent_vacancies(self, category: Optional[str] = None, limit: int = 50) -> List[Dict]:
-        """Получить неотправленные вакансии"""
+        """Получить одобренные неотправленные вакансии"""
         try:
-            endpoint = f"vacancies?is_sent=eq.false&order=created_at.asc&limit={limit}&select=*"
+            endpoint = (
+                f"vacancies?is_sent=eq.false&moderation_status=eq.approved"
+                f"&order=created_at.asc&limit={limit}&select=*"
+            )
             if category:
                 endpoint += f"&category=eq.{category}"
             result = self._request("GET", endpoint)
@@ -279,6 +494,42 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Ошибка получения неотправленных вакансий: {e}")
             return []
+
+    async def get_vacancy(self, vacancy_id: int) -> Optional[Dict]:
+        try:
+            result = self._request("GET", f"vacancies?id=eq.{vacancy_id}&select=*")
+            return result[0] if result else None
+        except Exception as e:
+            logger.error(f"Ошибка get_vacancy {vacancy_id}: {e}")
+            return None
+
+    async def get_vacancies_pending_moderation(self, limit: int = 20) -> List[Dict]:
+        try:
+            endpoint = (
+                f"vacancies?moderation_status=eq.pending"
+                f"&moderation_chat_message_id=is.null"
+                f"&order=created_at.asc&limit={limit}&select=*"
+            )
+            return self._request("GET", endpoint) or []
+        except Exception as e:
+            logger.error(f"Ошибка get_vacancies_pending_moderation: {e}")
+            return []
+
+    async def set_vacancy_moderation_status(
+        self,
+        vacancy_id: int,
+        status: str,
+        moderation_chat_message_id: Optional[int] = None,
+    ) -> bool:
+        try:
+            payload: Dict[str, Any] = {"moderation_status": status}
+            if moderation_chat_message_id is not None:
+                payload["moderation_chat_message_id"] = moderation_chat_message_id
+            self._request("PATCH", f"vacancies?id=eq.{vacancy_id}", json=payload)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка set_vacancy_moderation_status {vacancy_id}: {e}")
+            return False
     
     async def mark_vacancy_sent(self, vacancy_id: int) -> bool:
         """Отметить вакансию как отправленную"""
@@ -783,6 +1034,15 @@ class SupabaseClient:
             logger.error(f"Ошибка получения фото приветствия: {e}")
             return None
 
+    async def clear_welcome_photo(self) -> bool:
+        """Удалить сохранённое фото приветствия (например, если file_id устарел)"""
+        try:
+            self._request("DELETE", "welcome_photo")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка удаления фото приветствия: {e}")
+            return False
+
     async def set_welcome_photo(self, file_id: str, file_unique_id: str, uploaded_by: int) -> bool:
         """Установить фото для приветственного сообщения"""
         try:
@@ -917,7 +1177,7 @@ class SupabaseClient:
         review_id: int,
         moderator_id: int
     ) -> bool:
-        """Одобрить отзыв и начислить 3 дня x2"""
+        """Одобрить отзыв и начислить дни подписки"""
         try:
             # Получаем отзыв для получения tg_id пользователя
             review = await self.get_review(review_id)
@@ -940,10 +1200,9 @@ class SupabaseClient:
                 }
             )
             
-            # Начисляем 3 дня x2 статуса
-            await self.award_x2_status(user_tg_id, days=3)
+            await self.extend_subscription(user_tg_id, days=REVIEW_BONUS_DAYS)
             
-            logger.info(f"✅ Отзыв {review_id} одобрен, x2 начислен пользователю {user_tg_id}")
+            logger.info(f"✅ Отзыв {review_id} одобрен, +{REVIEW_BONUS_DAYS} дн. подписки для {user_tg_id}")
             return True
         except Exception as e:
             logger.error(f"Ошибка одобрения отзыва: {e}")
@@ -973,56 +1232,44 @@ class SupabaseClient:
             logger.error(f"Ошибка отклонения отзыва: {e}")
             return False
     
-    async def award_x2_status(self, tg_id: int, days: int = 3) -> bool:
-        """Начислить x2 статус на указанное количество дней"""
+    async def extend_subscription(self, tg_id: int, days: int = 1) -> bool:
+        """Продлить подписку на указанное количество дней."""
         try:
-            # Получаем текущего пользователя
             user = self._request("GET", f"users?tg_id=eq.{tg_id}")
             if not user:
                 logger.error(f"Пользователь {tg_id} не найден")
                 return False
-            
+
             user_data = user[0]
-            current_x2_until = user_data.get("x2_until")
-            
-            # Вычисляем новую дату окончания x2
+            current_until = user_data.get(SUBSCRIPTION_UNTIL_FIELD)
             now = datetime.now(timezone.utc)
-            
-            if current_x2_until:
-                # Если уже есть x2 статус - продлеваем
-                try:
-                    if isinstance(current_x2_until, str):
-                        current_date = datetime.fromisoformat(current_x2_until.replace('Z', '+00:00'))
-                    else:
-                        current_date = current_x2_until
-                    
-                    # Если текущий статус еще действует - продлеваем от текущей даты
-                    if current_date > now:
-                        new_x2_until = current_date + timedelta(days=days)
-                    else:
-                        # Если истек - начинаем с текущей даты
-                        new_x2_until = now + timedelta(days=days)
-                except Exception as e:
-                    logger.warning(f"Ошибка парсинга даты x2_until: {e}")
-                    new_x2_until = now + timedelta(days=days)
+            current_dt = parse_subscription_until(current_until)
+
+            if current_dt and current_dt > now:
+                new_until = current_dt + timedelta(days=days)
             else:
-                # Если x2 статуса нет - начинаем с текущей даты
-                new_x2_until = now + timedelta(days=days)
-            
-            # Обновляем пользователя
+                new_until = now + timedelta(days=days)
+
             self._request(
                 "PATCH",
                 f"users?tg_id=eq.{tg_id}",
-                json={
-                    "x2_until": new_x2_until.isoformat()
-                }
+                json={SUBSCRIPTION_UNTIL_FIELD: new_until.isoformat()},
             )
-            
-            logger.info(f"✅ Начислено {days} дней x2 статуса пользователю {tg_id}, до {new_x2_until}")
+
+            logger.info(
+                "✅ Подписка пользователя %s продлена на %s дн., до %s",
+                tg_id,
+                days,
+                new_until,
+            )
             return True
         except Exception as e:
-            logger.error(f"Ошибка начисления x2 статуса: {e}")
+            logger.error(f"Ошибка продления подписки: {e}")
             return False
+
+    async def award_x2_status(self, tg_id: int, days: int = 3) -> bool:
+        """Deprecated: используйте extend_subscription."""
+        return await self.extend_subscription(tg_id, days=days)
     
     # =========================================
     # REFERRAL SYSTEM
@@ -1071,108 +1318,62 @@ class SupabaseClient:
                     f"users?tg_id=eq.{referrer_id}",
                     json={"referral_count": new_count}
                 )
+
+            await self.extend_subscription(referrer_id, days=REFERRAL_BONUS_DAYS)
             
-            # Добавляем +24 часа x2 статуса пригласившему
-            referrer = await self.get_user(referrer_id)
-            if referrer:
-                current_x2_until = referrer.get("x2_until")
-                now = datetime.now(timezone.utc)
-                
-                if current_x2_until:
-                    try:
-                        x2_str = current_x2_until.replace('Z', '+00:00')
-                        if '+' not in x2_str and 'T' in x2_str:
-                            x2_str += '+00:00'
-                        current_x2_until_dt = datetime.fromisoformat(x2_str)
-                        
-                        # Делаем aware если нужно
-                        if current_x2_until_dt.tzinfo is None:
-                            current_x2_until_dt = current_x2_until_dt.replace(tzinfo=timezone.utc)
-                        
-                        if current_x2_until_dt > now:
-                            # Увеличиваем существующий срок
-                            new_x2_until = current_x2_until_dt + timedelta(hours=24)
-                        else:
-                            # Начинаем новый срок
-                            new_x2_until = now + timedelta(hours=24)
-                    except:
-                        new_x2_until = now + timedelta(hours=24)
-                else:
-                    new_x2_until = now + timedelta(hours=24)
-                
-                self._request(
-                    "PATCH",
-                    f"users?tg_id=eq.{referrer_id}",
-                    json={"x2_until": new_x2_until.isoformat()}
-                )
-            
-            logger.info(f"✅ Добавлен реферал: {referrer_id} -> {referred_id}")
+            logger.info(
+                "✅ Добавлен реферал: %s -> %s (+%s дн. подписки)",
+                referrer_id,
+                referred_id,
+                REFERRAL_BONUS_DAYS,
+            )
             return True
         except Exception as e:
             logger.error(f"Ошибка добавления реферала: {e}")
             return False
 
-    async def is_user_x2(self, tg_id: int) -> bool:
-        """Проверить, активен ли у пользователя статус x2"""
+    async def has_active_subscription(self, tg_id: int) -> bool:
+        """Проверить, активна ли подписка на вакансии."""
         try:
             user = await self.get_user(tg_id)
             if not user:
                 return False
-            
-            x2_until = user.get("x2_until")
-            if not x2_until:
-                return False
-            
-            try:
-                # Пробуем разные форматы даты
-                if isinstance(x2_until, str):
-                    # Убираем Z и добавляем timezone если нужно
-                    x2_str = x2_until.replace('Z', '+00:00')
-                    if '+' not in x2_str and 'T' in x2_str:
-                        x2_str += '+00:00'
-                    x2_until_dt = datetime.fromisoformat(x2_str)
-                else:
-                    # Если это уже datetime объект
-                    x2_until_dt = x2_until
-                
-                # Используем timezone-aware datetime для сравнения
-                now = datetime.now(timezone.utc)
-                
-                # Если x2_until_dt naive - делаем его aware
-                if x2_until_dt.tzinfo is None:
-                    x2_until_dt = x2_until_dt.replace(tzinfo=timezone.utc)
-                
-                is_active = x2_until_dt > now
-                logger.debug(f"Проверка x2 для {tg_id}: x2_until={x2_until_dt}, now={now}, active={is_active}")
-                return is_active
-            except Exception as e:
-                logger.error(f"Ошибка парсинга даты x2_until для {tg_id}: {e}, значение: {x2_until}")
-                return False
+            return is_subscription_active(user.get(SUBSCRIPTION_UNTIL_FIELD))
         except Exception as e:
-            logger.error(f"Ошибка проверки x2 статуса для {tg_id}: {e}")
+            logger.error(f"Ошибка проверки подписки для {tg_id}: {e}")
             return False
 
+    async def is_user_x2(self, tg_id: int) -> bool:
+        """Deprecated: используйте has_active_subscription."""
+        return await self.has_active_subscription(tg_id)
+
     async def get_referral_stats(self, tg_id: int) -> Dict[str, Any]:
-        """Получить статистику по рефералам"""
+        """Получить статистику по рефералам и подписке."""
         try:
             user = await self.get_user(tg_id)
             if not user:
-                return {"referral_count": 0, "referral_code": None, "x2_active": False, "x2_until": None}
-            
-            referral_count = user.get("referral_count", 0)
-            referral_code = user.get("referral_code")
-            x2_active = await self.is_user_x2(tg_id)
-            x2_until = user.get("x2_until")
-            
+                return {
+                    "referral_count": 0,
+                    "referral_code": None,
+                    "subscription_active": False,
+                    "subscription_until": None,
+                }
+
+            subscription_until = user.get(SUBSCRIPTION_UNTIL_FIELD)
             return {
-                "referral_count": referral_count,
-                "referral_code": referral_code,
-                "x2_active": x2_active,
-                "x2_until": x2_until
+                "referral_count": user.get("referral_count", 0),
+                "referral_code": user.get("referral_code"),
+                "subscription_active": is_subscription_active(subscription_until),
+                "subscription_until": subscription_until,
             }
         except Exception as e:
             logger.error(f"Ошибка получения статистики рефералов: {e}")
-            return {"referral_count": 0, "referral_code": None, "x2_active": False, "x2_until": None}
+            return {
+                "referral_count": 0,
+                "referral_code": None,
+                "subscription_active": False,
+                "subscription_until": None,
+            }
 
     async def create_referral_code(self, tg_id: int) -> Optional[str]:
         """Создать реферальный код для существующего пользователя"""
