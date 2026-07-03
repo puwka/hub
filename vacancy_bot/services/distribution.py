@@ -952,6 +952,62 @@ class VacancyDistributor:
         
         return result
     
+    @staticmethod
+    def _sanitize_html(text: str) -> str:
+        """Исправляет незакрытые/неправильно вложенные HTML-теги.
+        
+        Telegram требует строгую вложенность тегов.
+        Этот метод гарантирует, что все открытые теги закрыты
+        в правильном порядке (LIFO).
+        """
+        allowed_tags = {'b', 'i', 'u', 'code', 'pre', 'blockquote', 'a', 's'}
+        tag_pattern = re.compile(r'<(/?)(\w+)([^>]*)>')
+        
+        stack = []  # стек открытых тегов
+        result = []
+        last_end = 0
+        
+        for match in tag_pattern.finditer(text):
+            is_closing = match.group(1) == '/'
+            tag_name = match.group(2).lower()
+            
+            if tag_name not in allowed_tags:
+                continue
+            
+            result.append(text[last_end:match.start()])
+            
+            if not is_closing:
+                # Открывающий тег
+                result.append(match.group(0))
+                stack.append(tag_name)
+            else:
+                # Закрывающий тег
+                if tag_name in stack:
+                    # Закрываем все теги до нужного (восстанавливаем порядок)
+                    tags_to_reopen = []
+                    while stack and stack[-1] != tag_name:
+                        popped = stack.pop()
+                        result.append(f'</{popped}>')
+                        tags_to_reopen.append(popped)
+                    if stack:
+                        stack.pop()
+                        result.append(match.group(0))
+                    # Переоткрываем вложенные теги
+                    for t in reversed(tags_to_reopen):
+                        result.append(f'<{t}>')
+                        stack.append(t)
+                # Если тег не был открыт — просто пропускаем закрывающий
+            
+            last_end = match.end()
+        
+        result.append(text[last_end:])
+        
+        # Закрываем все оставшиеся открытые теги
+        while stack:
+            result.append(f'</{stack.pop()}>')
+        
+        return ''.join(result)
+    
     def format_vacancy(self, vacancy: Dict) -> str:
         """
         Форматирование вакансии для отправки в новом стандарте FreelanceHub.
@@ -1080,8 +1136,9 @@ class VacancyDistributor:
         
         message = f"{header}{quoted_text}{footer}"
         
-        # Не обрезаем сообщение - если оно длиннее 1024 символов,
-        # будем отправлять фото отдельно, а текст отдельным сообщением
+        # Санитизация HTML — гарантируем корректную вложенность тегов
+        message = self._sanitize_html(message)
+        
         return message.strip()
 
     async def _send_html_messages(self, tg_id: int, message_text: str) -> None:
@@ -1197,14 +1254,14 @@ class VacancyDistributor:
                 f"{error_type}: {str(e)[:200]}"
             )
             
-            # Пользователь заблокировал бота
-            if "blocked" in error_msg or "deactivated" in error_msg:
-                logger.info(f"Пользователь {tg_id} заблокировал бота")
+            # Пользователь заблокировал бота или не начал диалог
+            if "blocked" in error_msg or "deactivated" in error_msg or "can't initiate" in error_msg:
+                logger.info(f"Пользователь {tg_id} заблокировал бота или не начал диалог")
                 # Деактивируем пользователя
                 await db.ban_user(tg_id, ban=False)  # Просто отмечаем неактивным
                 
-            elif "chat not found" in error_msg:
-                logger.info(f"Чат не найден для {tg_id}")
+            elif "chat not found" in error_msg or "forbidden" in error_msg:
+                logger.info(f"Чат не найден или запрещен для {tg_id}")
                 
             elif "message is too long" in error_msg or "caption is too long" in error_msg:
                 logger.warning(f"Сообщение слишком длинное для {tg_id}, отправляем частями")
@@ -1273,17 +1330,26 @@ class VacancyDistributor:
                 skipped_no_subscription,
             )
 
+        eligible_users = len(users) - skipped_no_subscription
+
         logger.info(
             f"📊 Вакансия {vacancy_id}: отправлено {success_count} из {len(users)}"
         )
         
-        # Отмечаем вакансию как разосланную
-        await db.mark_vacancy_sent(vacancy_id)
-        
-        logger.info(
-            f"Вакансия {vacancy_id} разослана: "
-            f"{success_count}/{len(users)} успешно"
-        )
+        # Помечаем вакансию отправленной:
+        # - если хотя бы 1 отправка прошла
+        # - или если нет пользователей с подпиской (нет смысла повторять)
+        if success_count > 0 or eligible_users == 0:
+            await db.mark_vacancy_sent(vacancy_id)
+            logger.info(
+                f"Вакансия {vacancy_id} разослана: "
+                f"{success_count}/{len(users)} успешно"
+            )
+        else:
+            logger.warning(
+                f"⚠️ Вакансия {vacancy_id}: 0 отправок из {eligible_users} "
+                f"подписчиков — НЕ помечена как отправленная, будет повторена"
+            )
         
         return success_count
 
@@ -1590,6 +1656,7 @@ class VacancyDistributor:
 
         Telegram ограничивает caption до 1024 символов.
         Если текст длиннее — фото + текст отдельными сообщениями.
+        При ошибке парсинга HTML — повторяет без HTML.
         """
         default_photo_id = await db.get_default_photo()
 
@@ -1606,7 +1673,22 @@ class VacancyDistributor:
                     return
                 except Exception as e:
                     error_msg = str(e).lower()
-                    if "caption" in error_msg or "too long" in error_msg:
+                    if "parse entities" in error_msg or "can't parse" in error_msg:
+                        # HTML сломан — пробуем без HTML-разметки
+                        logger.warning(
+                            "Ошибка парсинга HTML для %s, отправляем без разметки", tg_id
+                        )
+                        plain_text = re.sub(r'<[^>]+>', '', message_text)
+                        try:
+                            await self.bot.send_photo(
+                                chat_id=tg_id,
+                                photo=default_photo_id,
+                                caption=plain_text[:1024],
+                            )
+                            return
+                        except Exception as e2:
+                            logger.error(f"Ошибка send_photo без HTML {tg_id}: {e2}")
+                    elif "caption" in error_msg or "too long" in error_msg:
                         logger.warning(
                             "Caption слишком длинный для %s, отправляем раздельно", tg_id
                         )
@@ -1620,5 +1702,19 @@ class VacancyDistributor:
         else:
             logger.warning(f"Дефолтное фото не задано — отправляем только текст {tg_id}")
 
-        await self._send_html_messages(tg_id, message_text)
+        # Отправляем текст, при ошибке HTML — без разметки
+        try:
+            await self._send_html_messages(tg_id, message_text)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "parse entities" in error_msg or "can't parse" in error_msg:
+                logger.warning("Ошибка HTML при отправке текста %s, отправляем plain", tg_id)
+                plain_text = re.sub(r'<[^>]+>', '', message_text)
+                await self.bot.send_message(
+                    chat_id=tg_id,
+                    text=plain_text,
+                    disable_web_page_preview=True,
+                )
+            else:
+                raise
 
