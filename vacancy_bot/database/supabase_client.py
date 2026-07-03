@@ -631,6 +631,31 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Ошибка получения вакансий на модерацию: {e}")
             return []
+
+    async def get_approved_user_vacancies(self, limit: int = 20) -> List[Dict]:
+        """Получить одобренные, но ещё не разосланные вакансии пользователей."""
+        try:
+            result = self._request(
+                "GET",
+                f"user_vacancies?status=eq.approved&order=created_at.asc&limit={limit}&select=*"
+            )
+            return result or []
+        except Exception as e:
+            logger.error(f"Ошибка получения одобренных вакансий: {e}")
+            return []
+
+    async def mark_user_vacancy_sent(self, vacancy_id: int) -> bool:
+        """Пометить пользовательскую вакансию как разосланную."""
+        try:
+            self._request(
+                "PATCH",
+                f"user_vacancies?id=eq.{vacancy_id}",
+                json={"status": "sent"},
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка mark_user_vacancy_sent {vacancy_id}: {e}")
+            return False
     
     async def approve_user_vacancy(self, vacancy_id: int, moderator_id: int) -> bool:
         """Одобрить вакансию пользователя"""

@@ -121,6 +121,11 @@ class TaskScheduler:
                     f"{sends_count} отправок"
                 )
             
+            # Рассылка одобренных пользовательских вакансий
+            user_sends = await self.distributor.distribute_user_vacancies()
+            if user_sends > 0:
+                logger.info(f"✅ User vacancies: {user_sends} отправок")
+            
         except Exception as e:
             logger.error(f"❌ Ошибка в задаче рассылки: {e}")
     

@@ -1479,57 +1479,75 @@ class VacancyDistributor:
             Количество успешных отправок
         """
         category = vacancy.get("category", "other")
-        
-        # Получаем пользователей
-        users = await db.get_users_by_category(category)
-        
-        if not users:
-            return 0
-        
-        # Форматируем вакансию
         category_data = CATEGORIES.get(category, CATEGORIES["other"])
+        vacancy_id = vacancy["id"]
         
-        message = f"""
-🔥 *Новая вакансия*
-
-📂 Категория: {category_data['name']}
-👤 Автор: @{vacancy.get('username') or 'пользователь'}
-
-{vacancy['text']}
-
-📞 Контакт: {vacancy['contact']}
-
-{category_data.get('hashtag', '#vacancy')}
-"""
+        # Форматируем в стиле основных вакансий (HTML)
+        text = vacancy.get("text", "").strip()
+        contact = vacancy.get("contact", "")
+        author = f"@{vacancy.get('username')}" if vacancy.get("username") else "пользователь"
+        
+        message_text = (
+            "🔥 Новая вакансия\n"
+            f"Направление: {category_data['name']}\n\n"
+            f"<blockquote>{text}\n\n"
+            f"<b>Контакт:</b> {contact}</blockquote>\n\n"
+            f"{category_data.get('hashtag', '#vacancy')}"
+        )
+        message_text = self._sanitize_html(message_text)
+        
+        # Получаем подписчиков
+        users = await db.get_users_by_category(category)
+        if not users:
+            logger.info(f"Нет пользователей для user_vacancy {vacancy_id}")
+            await db.mark_user_vacancy_sent(vacancy_id)
+            return 0
         
         success_count = 0
         
         for user in users:
+            # Не отправляем автору
+            if user["tg_id"] == vacancy.get("tg_id"):
+                continue
+            
+            # Проверяем подписку
+            if not await db.has_active_subscription(user["tg_id"]):
+                continue
+            
             try:
-                # Не отправляем автору его же вакансию
-                if user["tg_id"] == vacancy["tg_id"]:
-                    continue
-                
-                # Проверяем rate limit
-                if not await db.can_send_to_user(user["id"]):
-                    continue
-                
-                await self.bot.send_message(
-                    chat_id=user["tg_id"],
-                    text=message,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True
-                )
-                
+                await self._send_with_default_photo(user["tg_id"], message_text)
                 await db.record_send_log(user["id"])
                 success_count += 1
-                
-                await asyncio.sleep(config.rate_limit.min_delay_seconds)
-                
             except Exception as e:
-                logger.warning(f"Ошибка отправки {user['tg_id']}: {e}")
+                error_msg = str(e).lower()
+                if "blocked" in error_msg or "can't initiate" in error_msg or "forbidden" in error_msg:
+                    await db.ban_user(user["tg_id"], ban=False)
+                logger.warning(f"Ошибка отправки user_vacancy {user['tg_id']}: {e}")
+            
+            await asyncio.sleep(config.rate_limit.min_delay_seconds)
+        
+        # Помечаем как разосланную
+        await db.mark_user_vacancy_sent(vacancy_id)
+        logger.info(
+            f"📬 User vacancy {vacancy_id}: отправлено {success_count} подписчикам"
+        )
         
         return success_count
+    
+    async def distribute_user_vacancies(self) -> int:
+        """Разослать все одобренные пользовательские вакансии."""
+        vacancies = await db.get_approved_user_vacancies(limit=10)
+        if not vacancies:
+            return 0
+        
+        total = 0
+        for vacancy in vacancies:
+            sends = await self.send_approved_user_vacancy(vacancy)
+            total += sends
+            await asyncio.sleep(2)
+        
+        logger.info(f"📬 User vacancies: {len(vacancies)} вакансий, {total} отправок")
+        return total
     
     async def _download_photo_from_telethon(self, source_id: str, message_id: int) -> Optional[str]:
         """Загрузить фото из Telegram через Telethon и получить file_id от бота"""
