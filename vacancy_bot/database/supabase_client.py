@@ -225,6 +225,20 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Ошибка бана пользователя {tg_id}: {e}")
             return False
+
+    async def deactivate_user(self, tg_id: int) -> bool:
+        """Деактивировать пользователя (заблокировал бота / не начал диалог)."""
+        try:
+            self._request(
+                "PATCH",
+                f"users?tg_id=eq.{tg_id}",
+                json={"is_active": False}
+            )
+            logger.info(f"Пользователь {tg_id} деактивирован")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка деактивации пользователя {tg_id}: {e}")
+            return False
     
     # =========================================
     # VACANCIES (из парсинга)

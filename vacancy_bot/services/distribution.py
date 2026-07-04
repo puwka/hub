@@ -1258,7 +1258,7 @@ class VacancyDistributor:
             if "blocked" in error_msg or "deactivated" in error_msg or "can't initiate" in error_msg:
                 logger.info(f"Пользователь {tg_id} заблокировал бота или не начал диалог")
                 # Деактивируем пользователя
-                await db.ban_user(tg_id, ban=False)  # Просто отмечаем неактивным
+                await db.deactivate_user(tg_id)
                 
             elif "chat not found" in error_msg or "forbidden" in error_msg:
                 logger.info(f"Чат не найден или запрещен для {tg_id}")
@@ -1372,15 +1372,18 @@ class VacancyDistributor:
         cat = CATEGORIES.get(category_id, CATEGORIES["other"])
         raw = (vacancy.get("text") or vacancy.get("original_text") or "").strip()
         raw = remove_telegra_links(raw)
+        # Удаляем все HTML-теги из исходного текста — они часто сломаны
+        raw = re.sub(r'<[^>]+>', '', raw)
         if len(raw) > 3500:
             raw = raw[:3500] + "..."
-        return (
+        result = (
             f"📥 <b>Модерация вакансии</b> #{vacancy['id']}\n"
             f"Источник: {vacancy.get('source', '?')}\n"
             f"Категория: {cat['name']}\n"
             f"Quality: {vacancy.get('quality_score', 0)}\n\n"
             f"{raw}"
         )
+        return self._sanitize_html(result)
 
     async def send_pending_to_moderation(self) -> int:
         """Отправить новые вакансии в чат модерации."""
@@ -1521,7 +1524,7 @@ class VacancyDistributor:
             except Exception as e:
                 error_msg = str(e).lower()
                 if "blocked" in error_msg or "can't initiate" in error_msg or "forbidden" in error_msg:
-                    await db.ban_user(user["tg_id"], ban=False)
+                    await db.deactivate_user(user["tg_id"])
                 logger.warning(f"Ошибка отправки user_vacancy {user['tg_id']}: {e}")
             
             await asyncio.sleep(config.rate_limit.min_delay_seconds)
